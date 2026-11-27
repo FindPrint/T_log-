@@ -1,0 +1,1789 @@
+# -*- coding: utf-8 -*-
+"""
+UNIVERSAL_LOG v7.1.3 — ANALYSE SEULE, CORRECTIFS AUDIT EXTERNE
+Refonte carte blanche de v6.0.1 (SHA origine ce0557cb4c44c15a, 13056 lignes).
+v6 contenait 5 priors de domaine deguises en universel :
+ 1. DOMAIN_LEVEL_WEIGHTS : poids L1..L7 fixes a la main par domaine.
+ 2. DOMAIN_LEXICON : traduction selon le domaine declare.
+ 3. get_domain_target_semantic_direction() : signe +1/-1 decide par le NOM de colonne.
+ 4. HARMONIC_PROB=0.45 + phi/pi/e/sqrt2/sqrt3 comme prior de tirage MC.
+ 5. Defauts centres domaine : ising_classique.csv, Time, Close, FSS Ising synthetique.
+PRINCIPES v7 : P1 aucun nom de domaine. P2 aucun poids a la main (ponderation
+par stabilite inverse-variance, sinon poids egaux). P3 aucun sens par le nom
+(direction = signe de Cohen-d empirique). P4 aucun prior harmonique (MC uniforme
++ permutation ; harmonique = ablation comparee, jamais verite). P5 falsification
+d'abord (permutation, bruit blanc, split-half, walk-forward). P6 effet + IC +
+p, jamais un score seul. P7 reproductibilite totale (manifest + hash). P8 T_log
+= diagnostic calibre contre son nul, pas preuve.
+Garde de v6 : scan Cohen-d glissant, cascade 5 seuils, 29 estimateurs memes
+scenarios, multi-horizons 1..12, L1..L7 sans poids domaine, exclusion controle
+des flux, Cohen-d partout.
+USAGE : python UNIVERSAL_LOG_v7.1.5_universal.py --input data.csv --control X --target Y
+        python UNIVERSAL_LOG_v7.1.5_universal.py --demo step|logistic|null
+STATUT : instrument de detection de seuils + falsification. PAS une preuve
+d'une theorie, PAS un diagnostic medical, PAS un conseil financier.
+"""
+from __future__ import annotations
+import argparse, copy, hashlib, json, math, os, sys, tempfile, time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+VERSION = "v7.1.5-universal-audit"
+VERSION_MASTER = "v7.1.5-universal-audit-segmented-mc-f1f2"
+RANDOM_SEED = 42
+PHI = (1 + 5 ** 0.5) / 2; PI = math.pi; E = math.e; SQRT2 = math.sqrt(2); SQRT3 = math.sqrt(3)
+
+@dataclass
+class UniversalConfig:
+    seed: int = 42
+    mode: str = "fast"
+    horizons: List[int] = field(default_factory=lambda: list(range(1, 13)))
+    n_bootstrap: int = 200
+    n_permutations: int = 500
+    n_mc_paths: int = 200
+    window_sizes: List[int] = field(default_factory=lambda: [50, 80, 120])
+    min_group: int = 4
+    min_length: int = 50
+    harmonic_ablation: bool = False
+    harmonic_prob: float = 0.45
+    use_relative_windows: bool = True
+    n_scan_permutations: int = 50
+    min_analyses_for_prediction: int = 5
+    grade_rules: Dict[str, Any] = field(default_factory=lambda: {"min_cohen_d": 0.5, "max_p_perm": 0.05, "min_stability": 0.60, "min_walkforward_f1": 0.50})
+    output_dir: str = "./results_v7"
+    verbose: bool = True
+    def to_dict(self): return asdict(self)
+
+MODE_PRESETS = {
+    # v7.1 : les fenetres sont RELATIVES a n (n/10, n/5, n/3) quand use_relative_windows=True.
+    # Les window_sizes des presets ne servent plus que si use_relative_windows=False.
+    "fast": dict(n_bootstrap=100, n_permutations=200, n_mc_paths=100, window_sizes=[50, 80], n_scan_permutations=50),
+    "robust": dict(n_bootstrap=300, n_permutations=500, n_mc_paths=200, window_sizes=[50, 80, 120], n_scan_permutations=100),
+    "full": dict(n_bootstrap=1000, n_permutations=1000, n_mc_paths=400, window_sizes=[50, 80, 120, 180, 220], n_scan_permutations=200),
+}
+def _log(cfg, msg):
+    if cfg.verbose: print(msg, flush=True)
+def _safe_float(x, default=float("nan")):
+    try:
+        v = float(x); return v if math.isfinite(v) else default
+    except Exception: return default
+def _finite(arr):
+    a = np.asarray(arr, dtype=float); return a[np.isfinite(a)]
+
+@dataclass
+class UniversalDataset:
+    control: np.ndarray; control_name: str; target: np.ndarray; target_name: str
+    fluxes: Dict[str, np.ndarray]; flux_names: List[str]; n: int; control_monotone: bool
+    source_hash: str = ""; source_name: str = ""
+
+def load_universal_dataset(df, control=None, target=None, fluxes=None, source_name="dataframe", source_hash=""):
+    """Infere controle/cible/flux SANS lexique, SANS nom magique.
+    Controle : donne, sinon 1ere colonne numerique strictement monotone, sinon indice.
+    Cible : donnee, sinon 1ere numerique != controle. Flux : toutes numeriques != controle.
+    Exclusion controle des flux par nom normalise (v6.0.1 generalisee). Tri par controle.
+    NaN : lignes ecartees et signalees, jamais imputees silencieusement."""
+    if df is None or len(df) == 0: raise ValueError("DataFrame vide.")
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    if len(numeric) < 2: raise ValueError(f"Il faut >=2 colonnes numeriques, trouve {numeric}.")
+    if control is not None and control not in df.columns: raise ValueError(f"Controle '{control}' absent. Colonnes : {list(df.columns)}")
+    control_name = control
+    if control_name is None:
+        mono = [c for c in numeric if len(_finite(df[c].values)) >= 2 and bool(np.all(np.diff(_finite(df[c].values)) > 0))]
+        control_name = mono[0] if mono else None
+    if control_name is None:
+        control_name = "__index__"; control_values = np.arange(len(df), dtype=float); control_monotone = True
+    else:
+        control_values = df[control_name].values.astype(float)
+        control_monotone = bool(len(_finite(control_values)) >= 2 and np.all(np.diff(_finite(control_values)) > 0))
+    if target is not None and target not in df.columns: raise ValueError(f"Cible '{target}' absente.")
+    target_name = target or next((c for c in numeric if c != control_name), numeric[0])
+    target_values = df[target_name].values.astype(float) if target_name in df.columns else control_values.copy()
+    def _norm(s): return "".join(ch for ch in str(s).lower() if ch.isalnum())
+    ctrl_norm = _norm(control_name)
+    if fluxes is None: flux_names = [c for c in numeric if _norm(c) != ctrl_norm]
+    else: flux_names = [c for c in fluxes if c in df.columns and _norm(c) != ctrl_norm]
+    order = np.argsort(control_values, kind="stable")
+    c_sorted, y_sorted = control_values[order], target_values[order]
+    mask = np.isfinite(c_sorted) & np.isfinite(y_sorted)
+    n_drop = int((~mask).sum())
+    if n_drop: print(f"[DATA] {n_drop}/{len(df)} lignes ecartees (NaN controle/cible). Aucune imputation silencieuse.")
+    c_sorted, y_sorted = c_sorted[mask], y_sorted[mask]
+    fluxes_dict = {}
+    for name in flux_names: fluxes_dict[name] = df[name].values.astype(float)[order][mask]
+    if target_name not in fluxes_dict and target_name in df.columns:
+        fluxes_dict[target_name] = y_sorted
+    return UniversalDataset(control=c_sorted, control_name=str(control_name), target=y_sorted, target_name=str(target_name), fluxes=fluxes_dict, flux_names=list(fluxes_dict.keys()), n=int(len(c_sorted)), control_monotone=bool(control_monotone), source_hash=source_hash, source_name=source_name)
+
+def cohen_d(a, b):
+    a, b = _finite(a), _finite(b)
+    if len(a) < 2 or len(b) < 2: return float("nan")
+    ma, mb = float(np.mean(a)), float(np.mean(b))
+    va, vb = float(np.var(a, ddof=1)), float(np.var(b, ddof=1))
+    pooled = math.sqrt(((len(a)-1)*va + (len(b)-1)*vb) / max(len(a)+len(b)-2, 1))
+    if pooled == 0 or not math.isfinite(pooled): return 0.0 if ma == mb else float("nan")
+    return (mb - ma) / pooled
+
+def bootstrap_ci_cohen_d(a, b, n_boot=200, seed=42, alpha=0.05):
+    d = cohen_d(a, b)
+    if not math.isfinite(d): return d, float("nan"), float("nan")
+    rng = np.random.default_rng(seed); a, b = _finite(a), _finite(b); boots = []
+    for _ in range(int(n_boot)):
+        db = cohen_d(rng.choice(a, size=len(a), replace=True), rng.choice(b, size=len(b), replace=True))
+        if math.isfinite(db): boots.append(db)
+    if len(boots) < 10: return d, float("nan"), float("nan")
+    lo, hi = np.percentile(boots, [100*alpha/2, 100*(1-alpha/2)])
+    return float(d), float(lo), float(hi)
+
+def permutation_p_value(a, b, n_perm=500, seed=42):
+    d_obs = cohen_d(a, b)
+    if not math.isfinite(d_obs): return float("nan")
+    pooled = np.concatenate([_finite(a), _finite(b)]); na = len(_finite(a))
+    rng = np.random.default_rng(seed); count = 0
+    for _ in range(int(n_perm)):
+        rng.shuffle(pooled)
+        dp = cohen_d(pooled[:na], pooled[na:])
+        if math.isfinite(dp) and abs(dp) >= abs(d_obs): count += 1
+    return (count + 1) / (n_perm + 1)
+
+def _embed(x, dim=2, tau=1):
+    x = _finite(x)
+    if len(x) < (dim-1)*tau + 2: return None
+    n = len(x); L = n - (dim-1)*tau
+    return np.column_stack([x[i*tau:i*tau+L] for i in range(dim)])
+
+def est_higuchi(x, kmax=10):
+    x = _finite(x); n = len(x)
+    if n < 20: return float("nan")
+    LK = []
+    for k in range(1, min(kmax, n//4)+1):
+        Lm = []
+        for m in range(k):
+            idx = np.arange(m, n, k)
+            if len(idx) < 2: continue
+            Lm.append(np.sum(np.abs(np.diff(x[idx]))) * (n-1) / (len(idx)*k) / k)
+        if Lm: LK.append(np.mean(Lm))
+    if len(LK) < 3: return float("nan")
+    ks = np.arange(1, len(LK)+1)
+    return float(np.polyfit(np.log(1/ks), np.log(np.maximum(LK, 1e-12)), 1)[0])
+def est_katz(x):
+    x = _finite(x); n = len(x)
+    if n < 10: return float("nan")
+    L = float(np.sum(np.abs(np.diff(x)))); d = float(np.max(np.abs(x - x[0])))
+    if L == 0 or d == 0: return float("nan")
+    return float(math.log10(n) / (math.log10(n) + math.log10(d / L)))
+def est_petrosian(x):
+    x = _finite(x); n = len(x)
+    if n < 10: return float("nan")
+    d = np.diff(np.sign(np.diff(x))); Ndelta = int(np.sum(d != 0))
+    if Ndelta == 0: return float("nan")
+    return float(math.log10(n) / (math.log10(n) + math.log10(n / (n + 0.4*Ndelta))))
+def est_sevcik(x):
+    x = _finite(x); n = len(x)
+    if n < 10: return float("nan")
+    ptp = np.ptp(x); xn = (x - np.min(x)) / (ptp if ptp > 0 else 1.0); yn = np.linspace(0, 1, n)
+    L = float(np.sum(np.sqrt(np.diff(xn)**2 + np.diff(yn)**2)))
+    if L <= 0: return float("nan")
+    return float(1 + math.log(L) / math.log(2*(n-1)))
+def est_boxcount(x, scales=(2, 4, 8, 16)):
+    x = _finite(x); n = len(x)
+    if n < 32: return float("nan")
+    counts = []
+    for s in scales:
+        if s >= n: continue
+        ptp = np.ptp(x); xn = (x - np.min(x)) / (ptp if ptp > 0 else 1.0)
+        counts.append(len(np.unique(np.floor(xn*s).astype(int))) + s)
+    if len(counts) < 2: return float("nan")
+    return float(np.polyfit(np.log(np.array(scales[:len(counts)])), np.log(np.maximum(counts, 1)), 1)[0])
+def est_dfa(x, scales=(4, 8, 16, 32)):
+    x = _finite(x); n = len(x)
+    if n < 40: return float("nan")
+    y = np.cumsum(x - np.mean(x)); Fs = []; sc = []
+    for s in scales:
+        if s >= n//2: continue
+        m = n // s; F = []
+        for i in range(m):
+            seg = y[i*s:(i+1)*s]; t = np.arange(s); coef = np.polyfit(t, seg, 1)
+            F.append(np.mean((seg - np.polyval(coef, t))**2))
+        if F: Fs.append(np.sqrt(np.mean(F))); sc.append(s)
+    if len(Fs) < 2: return float("nan")
+    return float(np.polyfit(np.log(np.array(sc, dtype=float)), np.log(np.maximum(Fs, 1e-12)), 1)[0])
+def est_hurst_rs(x):
+    x = _finite(x); n = len(x)
+    if n < 20: return float("nan")
+    vals = []
+    for size in [n//4, n//2, n]:
+        if size < 8: continue
+        seg = x[:size]; m = np.mean(seg); Y = np.cumsum(seg - m); R = np.ptp(Y); S = np.std(seg, ddof=1)
+        if S > 0 and R > 0: vals.append((size, R/S))
+    if len(vals) < 2: return float("nan")
+    return float(np.polyfit(np.log([v[0] for v in vals]), np.log([v[1] for v in vals]), 1)[0])
+def est_sample_entropy(x, m=2, r_frac=0.2):
+    x = _finite(x); n = len(x)
+    if n < 30: return float("nan")
+    r = r_frac * np.std(x, ddof=1)
+    if r == 0: return float("nan")
+    def _phi(mm):
+        emb = np.array([x[i:i+mm] for i in range(n-mm+1)]); cnt = 0; tot = 0
+        for i in range(len(emb)):
+            d = np.max(np.abs(emb - emb[i]), axis=1); cnt += int(np.sum(d <= r) - 1); tot += len(emb)-1
+        return cnt / max(tot, 1)
+    a, b = _phi(m), _phi(m+1)
+    if a <= 0 or b <= 0: return float("nan")
+    return float(-math.log(b/a))
+def est_perm_entropy(x, order=3, tau=1):
+    x = _finite(x); n = len(x)
+    if n < 30: return float("nan")
+    from itertools import permutations
+    patterns = list(permutations(range(order))); counts = {p: 0 for p in patterns}; tot = 0
+    for i in range(n - (order-1)*tau):
+        w = x[i:i+(order-1)*tau+1:tau]; rank = tuple(np.argsort(np.argsort(w)))
+        if rank in counts: counts[rank] += 1; tot += 1
+    if tot == 0: return float("nan")
+    probs = np.array([v/tot for v in counts.values() if v > 0])
+    return float(-np.sum(probs * np.log(probs)) / math.log(math.factorial(order)))
+def est_spectral_beta(x):
+    x = _finite(x); n = len(x)
+    if n < 32: return float("nan")
+    spec = np.abs(np.fft.rfft(x - np.mean(x)))**2; freq = np.fft.rfftfreq(n)[1:]; spec = spec[1:]
+    mask = (freq > 0) & (spec > 0)
+    if mask.sum() < 5: return float("nan")
+    return float(-np.polyfit(np.log(freq[mask]), np.log(spec[mask]), 1)[0])
+def est_lz_complexity(x):
+    x = _finite(x); n = len(x)
+    if n < 20: return float("nan")
+    med = np.median(x); s = "".join("1" if v > med else "0" for v in x)
+    i, k, c = 0, 1, 1
+    while i + k <= n:
+        if s[i:i+k] not in s[:i] and i > 0: c += 1; i += k; k = 1
+        else: k += 1
+        if i + k > n: break
+    return float(c / (n / max(math.log2(n), 1e-9)))
+def est_autocorr1(x):
+    x = _finite(x)
+    if len(x) < 10 or np.std(x) == 0: return float("nan")
+    return float(np.corrcoef(x[:-1], x[1:])[0, 1])
+def est_skew(x):
+    x = _finite(x)
+    if len(x) < 5 or np.std(x) == 0: return float("nan")
+    m, s = np.mean(x), np.std(x); return float(np.mean(((x-m)/s)**3))
+def est_kurtosis(x):
+    x = _finite(x)
+    if len(x) < 5 or np.std(x) == 0: return float("nan")
+    m, s = np.mean(x), np.std(x); return float(np.mean(((x-m)/s)**4) - 3)
+def est_corr_dim_d2(x, dim=2):
+    x = _finite(x)
+    if len(x) < 50: return float("nan")
+    emb = _embed(x, dim=dim)
+    if emb is None: return float("nan")
+    if len(emb) > 300: emb = emb[np.linspace(0, len(emb)-1, 300).astype(int)]
+    from scipy.spatial.distance import pdist
+    d = pdist(emb); d = d[d > 0]
+    if len(d) < 10: return float("nan")
+    rs = np.percentile(d, [10, 25, 50, 75]); cs = [float(np.mean(d < r)) for r in rs]
+    if any(c <= 0 for c in cs): return float("nan")
+    return float(np.polyfit(np.log(rs), np.log(cs), 1)[0])
+def est_levina_bickel(x, k=10):
+    x = _finite(x)
+    if len(x) < 30: return float("nan")
+    emb = _embed(x, dim=2)
+    if emb is None: return float("nan")
+    if len(emb) > 300: emb = emb[np.linspace(0, len(emb)-1, 300).astype(int)]
+    from scipy.spatial.distance import cdist
+    D = np.sort(cdist(emb, emb), axis=1)[:, 1:k+1]; D = np.maximum(D, 1e-12)
+    vals = np.mean(np.log(D[:, -1:] / D[:, :-1]), axis=1); vals = vals[vals > 0]
+    if len(vals) == 0: return float("nan")
+    return float(1.0 / np.mean(vals))
+def est_pca_participation(x, dim=3):
+    x = _finite(x)
+    if len(x) < 30: return float("nan")
+    emb = _embed(x, dim=dim)
+    if emb is None: return float("nan")
+    w = np.linalg.eigvalsh(np.cov(emb.T)); w = w[w > 0]
+    if len(w) == 0: return float("nan")
+    p = w / np.sum(w); return float(1.0 / np.sum(p**2))
+def est_information_d1(x, dim=2, bins=8):
+    x = _finite(x)
+    if len(x) < 50: return float("nan")
+    emb = _embed(x, dim=dim)
+    if emb is None: return float("nan")
+    hist, _ = np.histogramdd(emb, bins=bins); p = hist.flatten() / np.sum(hist); p = p[p > 0]
+    return float(-np.sum(p*np.log(p)) / math.log(bins))
+def est_two_nn(x):
+    x = _finite(x)
+    if len(x) < 30: return float("nan")
+    emb = _embed(x, dim=2)
+    if emb is None: return float("nan")
+    if len(emb) > 300: emb = emb[np.linspace(0, len(emb)-1, 300).astype(int)]
+    from scipy.spatial.distance import cdist
+    D = np.sort(cdist(emb, emb), axis=1)[:, 1:3]
+    ratio = D[:, 1] / np.maximum(D[:, 0], 1e-12); ratio = ratio[np.isfinite(ratio) & (ratio > 1)]
+    if len(ratio) < 10: return float("nan")
+    return float(1.0 / np.mean(np.log(ratio)))
+def est_lyapunov_rosenstein(x, dim=2, tau=1, max_t=10):
+    x = _finite(x)
+    if len(x) < 60: return float("nan")
+    emb = _embed(x, dim=dim, tau=tau)
+    if emb is None or len(emb) < max_t+5: return float("nan")
+    from scipy.spatial.distance import cdist
+    D = cdist(emb, emb); np.fill_diagonal(D, np.inf); nn = np.argmin(D, axis=1); divs = []
+    for t in range(1, max_t+1):
+        vals = [np.linalg.norm(emb[i+t]-emb[nn[i]+t]) for i in range(len(emb)-t) if nn[i]+t < len(emb)]
+        if vals: divs.append(np.mean(np.log(np.maximum(vals, 1e-12))))
+    if len(divs) < 3: return float("nan")
+    return float(np.polyfit(np.arange(1, len(divs)+1), divs, 1)[0])
+def est_danco(x):
+    x = _finite(x)
+    if len(x) < 30: return float("nan")
+    emb = _embed(x, dim=2)
+    if emb is None: return float("nan")
+    d = np.linalg.norm(emb - np.mean(emb, axis=0), axis=1)
+    if np.median(d) <= 0: return float("nan")
+    return float(np.log(len(d)) / max(np.log(np.max(d)/np.median(d)), 1e-9))
+
+# --- v7.1.4 : implementations distinctes pour les anciens alias ---
+def est_grassberger_procaccia(x, dims=(2,3,4), tau=1):
+    x=_finite(x)
+    if len(x)<60: return float('nan')
+    from scipy.spatial.distance import pdist
+    rs=[]; cs=[]
+    for dim in dims:
+        emb=_embed(x,dim=dim,tau=tau)
+        if emb is None or len(emb)<30: continue
+        if len(emb)>250: emb=emb[np.linspace(0,len(emb)-1,250).astype(int)]
+        d=pdist(emb); d=d[d>0]
+        if len(d)<100: continue
+        radii=np.quantile(d,[.05,.08,.12,.18,.25])
+        corr=np.array([np.mean(d<r) for r in radii])
+        good=(corr>0)&np.isfinite(corr)
+        if good.sum()>=3:
+            slope=np.polyfit(np.log(radii[good]),np.log(corr[good]),1)[0]
+            rs.append(float(dim)); cs.append(float(slope))
+    return float(np.median(cs)) if cs else float('nan')
+
+def _natural_visibility_adjacency(x, max_n=240):
+    x=_finite(x)
+    if len(x)<8: return None
+    if len(x)>max_n: x=x[np.linspace(0,len(x)-1,max_n).astype(int)]
+    n=len(x); adj=[set() for _ in range(n)]
+    for i in range(n-1): adj[i].add(i+1); adj[i+1].add(i)
+    for i in range(n-2):
+        slope=-np.inf
+        for j in range(i+2,n):
+            cur=(x[j]-x[i])/(j-i)
+            if cur>slope:
+                adj[i].add(j); adj[j].add(i); slope=cur
+    return adj
+
+def est_visibility_graph(x):
+    adj=_natural_visibility_adjacency(x)
+    if adj is None: return float('nan')
+    deg=np.asarray([len(a) for a in adj],dtype=float); deg=deg[deg>0]
+    if len(deg)<8: return float('nan')
+    # Exposant de queue de distribution des degres; indicateur de reseau, pas dimension fractale.
+    vals=np.sort(deg); tail=vals[ max(0,int(.6*len(vals))):]
+    if len(tail)<4 or np.all(tail==tail[0]): return float('nan')
+    return float(1.0+len(tail)/np.sum(np.log(tail/tail.min())))
+
+def est_graph_cluster(x):
+    adj=_natural_visibility_adjacency(x)
+    if adj is None: return float('nan')
+    vals=[]
+    for i,nei in enumerate(adj):
+        k=len(nei)
+        if k<2: continue
+        links=sum(1 for a in nei for b in nei if a<b and b in adj[a])
+        vals.append(2.0*links/(k*(k-1)))
+    return float(np.mean(vals)) if vals else float('nan')
+
+def est_fisher_dimension(x, bins=16):
+    x=_finite(x)
+    if len(x)<20 or np.std(x)==0: return float('nan')
+    hist,_=np.histogram(x,bins=bins,density=True); p=hist/np.sum(hist)
+    p=p[p>0]
+    # Entropie de Fisher effective (informationnelle), pas une dimension geometrique.
+    return float(np.exp(-np.sum(p*np.log(p)))) if len(p) else float('nan')
+
+def est_local_pca(x, dim=5, k=20):
+    x=_finite(x); emb=_embed(x,dim=dim)
+    if emb is None or len(emb)<k+2: return float('nan')
+    from scipy.spatial.distance import cdist
+    if len(emb)>400: emb=emb[np.linspace(0,len(emb)-1,400).astype(int)]
+    D=cdist(emb,emb); np.fill_diagonal(D,np.inf); vals=[]
+    for i in range(len(emb)):
+        ix=np.argpartition(D[i],min(k,len(emb)-1))[:min(k,len(emb)-1)]
+        cov=np.cov(emb[ix].T); w=np.linalg.eigvalsh(cov); w=np.maximum(w,0)
+        if w.sum()>0:
+            q=w/w.sum(); vals.append(float(1/np.sum(q*q)))
+    return float(np.median(vals)) if vals else float('nan')
+
+def est_persistent_homology(x):
+    x=_finite(x)
+    if len(x)<20: return float('nan')
+    try:
+        from ripser import ripser
+        emb=_embed(x,dim=2)
+        if emb is None: return float('nan')
+        if len(emb)>250: emb=emb[np.linspace(0,len(emb)-1,250).astype(int)]
+        dgms=ripser(emb,maxdim=1)['dgms']
+        lifetimes=[]
+        for dgm in dgms:
+            if len(dgm):
+                life=dgm[:,1]-dgm[:,0]; life=life[np.isfinite(life)&(life>0)]
+                lifetimes.extend(life.tolist())
+        if len(lifetimes)<2: return float('nan')
+        q=np.asarray(lifetimes); q=q/q.sum()
+        return float(-np.sum(q*np.log(q)))
+    except ImportError:
+        return float('nan')
+
+def _mfdfa_q_spectrum(x, q_values):
+    x=_finite(x); n=len(x)
+    if n<80 or np.std(x)==0: return None
+    y=np.cumsum(x-np.mean(x)); scales=sorted(set([max(8,n//32),max(10,n//16),max(12,n//8),max(16,n//4)]))
+    scales=[v for v in scales if v<n//2]
+    if len(scales)<3: return None
+    hq=[]
+    for q in q_values:
+        fs=[]; ss=[]
+        for scale in scales:
+            m=n//scale; local=[]
+            for offset in (0,n-m*scale):
+                for j in range(m):
+                    seg=y[offset+j*scale:offset+(j+1)*scale]; t=np.arange(scale)
+                    coef=np.polyfit(t,seg,1); var=np.mean((seg-np.polyval(coef,t))**2)
+                    if var>0: local.append(var)
+            if len(local)<4: continue
+            a=np.asarray(local)
+            F=(np.mean(a**(q/2)))**(1/q) if q!=0 else float(np.exp(.5*np.mean(np.log(a))))
+            if F>0: fs.append(F); ss.append(scale)
+        if len(fs)>=3: hq.append(float(np.polyfit(np.log(ss),np.log(fs),1)[0]))
+        else: hq.append(float('nan'))
+    return np.asarray(hq)
+
+def est_mfa(x):
+    h=_mfdfa_q_spectrum(x,[-4,-2,0,2,4])
+    if h is None or np.sum(np.isfinite(h))<3: return float('nan')
+    return float(np.nanmax(h)-np.nanmin(h))
+
+def est_mfdfa_spectrum(x):
+    q=np.asarray([-5,-3,-1,1,3,5],dtype=float)
+    h=_mfdfa_q_spectrum(x,q)
+    if h is None or np.sum(np.isfinite(h))<4: return float('nan')
+    # Largeur de la courbure tau(q)=q*h(q)-1, distincte du DFA monofractal.
+    tau=q*h-1; good=np.isfinite(tau)
+    return float(np.nanmax(tau[good])-np.nanmin(tau[good]))
+
+def est_danco(x):
+    # DANCo n'est pas implemente dans cette distribution; NaN explicite plutot qu'un proxy trompeur.
+    return float('nan')
+
+ESTIMATORS = [
+    ("Higuchi", est_higuchi, True), ("DFA", est_dfa, True), ("Katz", est_katz, True),
+    ("Hurst", est_hurst_rs, False), ("SampleEn", est_sample_entropy, False),
+    ("Petrosian", est_petrosian, True), ("Sevcik", est_sevcik, True),
+    ("BoxCounting", est_boxcount, True), ("PermutationEntropy", est_perm_entropy, False),
+    ("CorrelationD2", est_corr_dim_d2, True), ("GrassbergerProcaccia", est_grassberger_procaccia, True),
+    ("InformationD1", est_information_d1, True), ("LevinaBickel", est_levina_bickel, True),
+    ("TwoNN", est_two_nn, True), ("PCA_Participation", est_pca_participation, True),
+    ("LyapunovRosenstein", est_lyapunov_rosenstein, False),
+    ("SpectralBeta", est_spectral_beta, False), ("KolmogorovLZ", est_lz_complexity, False),
+    ("VisibilityGraph", est_visibility_graph, False), ("Danco", est_danco, False),
+    ("FisherDimension", est_fisher_dimension, False), ("LocalPCA", est_local_pca, True),
+    ("GraphCluster", est_graph_cluster, False), ("PersistentHomology", est_persistent_homology, False),
+    ("MFA", est_mfa, False), ("MFDFASpectrum", est_mfdfa_spectrum, False),
+    ("Autocorr1", est_autocorr1, False), ("Skewness", est_skew, False),
+    ("Kurtosis", est_kurtosis, False),
+]
+assert len(ESTIMATORS) == 29
+# v7.1.4 : les anciens alias les plus flagrants ont des implementations separees.
+# DANCo reste explicitement non implemente (NaN); les estimateurs optionnels peuvent
+# aussi etre indisponibles si leur dependance n'est pas installee. La deduplication
+# historique de L7 est conservee et reste visible dans n_estimators_distinct.
+DIMENSION_NAMES = {n for n, _, d in ESTIMATORS if d}
+def _unique_estimators():
+    """Retourne les estimateurs dedupliques par fonction (premier nom garde)."""
+    seen, out = set(), []
+    for name, fn, is_dim in ESTIMATORS:
+        key = getattr(fn, "__name__", str(fn))
+        if key in seen: continue
+        seen.add(key); out.append((name, fn, is_dim))
+    return out
+UNIQUE_ESTIMATORS = _unique_estimators()
+UNIQUE_DIMENSION_NAMES = {n for n, _, d in UNIQUE_ESTIMATORS if d}
+def apply_estimators(series):
+    out = {}
+    for name, fn, _ in ESTIMATORS:
+        try: out[name] = _safe_float(fn(series))
+        except Exception: out[name] = float("nan")
+    return out
+def compute_tlog(est, n):
+    # v7.1.3 : mediane sur fonctions distinctes, pas sur 29 noms (alias = double-compte).
+    _seen_fn, dims = set(), []
+    for _name, _fn, _is_dim in ESTIMATORS:
+        if not _is_dim: continue
+        _key = getattr(_fn, "__name__", str(_fn))
+        if _key in _seen_fn: continue
+        _seen_fn.add(_key)
+        _v = est.get(_name, float("nan"))
+        if math.isfinite(_v): dims.append(_v)
+    if not dims or n <= 1: return {"t_log": float("nan"), "d_median": float("nan"), "n_dimension_estimators": 0, "note": "non calculable — diagnostic uniquement"}
+    d_med = float(np.median(dims))
+    return {"t_log": float((d_med - 4.0) * math.log(n)), "d_median": d_med, "n_dimension_estimators": len(dims), "note": "diagnostic, pas preuve — calibre contre son nul permutation"}
+
+# ---------------------------------------------------------------------------
+# SCAN DE SEUIL + CASCADE 5 SEUILS — sans prior, avec IC
+# v7.1 : p corrige pour la RECHERCHE du seuil (scan complet par permutation)
+# ---------------------------------------------------------------------------
+def _scan_max_d(control, target, window=80, min_group=4):
+    """Scan leger sans bootstrap ni p : retourne le max |Cohen-d| local et son idx.
+    Utilise pour le p corrige : chaque permutation est re-scannee entierement."""
+    n = len(target)
+    if n < 2*min_group + 4: return float("nan"), None
+    # fenetre cappee a n//3 : une fenetre plus grande ne laisse aucun candidat central
+    w = int(max(min_group, min(window, max(min_group, n//3))))
+    cands = list(range(w, n - w))
+    if len(cands) > 400:
+        # v7.1.3 AUDIT : l'ancien linspace(min_group, n-min_group-1) reintroduisait des
+        # indices de bordure <w et >n-w, violant la regle fenetre complete des deux cotes.
+        # Maintenant linspace(w, n-w-1), deduplique et trie.
+        cands = sorted(set(int(x) for x in np.linspace(w, n - w - 1, 400).astype(int) if w <= int(x) < n - w))
+    best_d, best_idx = float("nan"), None
+    for idx in cands:
+        pre, post = target[max(0, idx-w):idx], target[idx:idx+w]
+        if len(pre) < min_group or len(post) < min_group: continue
+        d = cohen_d(pre, post)
+        if math.isfinite(d) and (best_idx is None or abs(d) > abs(best_d)):
+            best_d, best_idx = float(d), int(idx)
+    return best_d, best_idx
+
+def scan_corrected_p(control, target, window=80, min_group=4, n_perm=50, seed=42):
+    """p corrige pour la recherche du seuil.
+    Procedure : on melange la cible (casse le lien controle-cible, garde la distribution),
+    on RE-SCANNE entierement chaque permutation, on prend le max |d| de chaque permutation,
+    on compare le max |d| observe a cette distribution des max.
+    Un p=0.04 sur le seuil choisi ne vaut rien ; un p corrige <=0.05 veut dire que meme
+    le meilleur seuil trouve par hasard ne bat pas l'observe."""
+    d_obs, _ = _scan_max_d(control, target, window=window, min_group=min_group)
+    if not math.isfinite(d_obs): return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    null_max = []
+    for _ in range(int(n_perm)):
+        perm = rng.permutation(np.asarray(target, dtype=float))
+        d_perm, _ = _scan_max_d(control, perm, window=window, min_group=min_group)
+        if math.isfinite(d_perm): null_max.append(abs(d_perm))
+    if not null_max: return float("nan"), float("nan"), float("nan")
+    null_max = np.array(null_max)
+    p_corr = (float(np.sum(null_max >= abs(d_obs))) + 1) / (len(null_max) + 1)
+    return float(p_corr), float(np.median(null_max)), float(np.percentile(null_max, 95))
+
+def scan_threshold(control, target, window=80, min_group=4, seed=42, n_boot=100, n_perm=200, n_scan_perm=50, compute_scan_p=True):
+    """Balaye chaque position candidate comme seuil.
+    FENETRE LOCALE REELLE : on compare window points avant vs window points apres
+    la candidate (pas tout le passe vs tout le futur). Sans ca, la stabilite
+    multi-fenetres serait tautologique. Le meilleur seuil = max |Cohen-d| local.
+    L'effet GLOBAL (tout pre vs tout post) est rapporte separement pour le grade."""
+    n = len(target)
+    if n < 2*min_group + 4:
+        return {"status": "insufficient_data", "reason": f"n={n} trop petit"}
+    # v7.1 : fenetre cappee a n//3, sinon aucun candidat central et stabilite vacuite
+    w = int(max(min_group, min(window, max(min_group, n//3))))
+    # Exiger fenetre COMPLETE des deux cotes : un seuil en bordure est un artefact de troncature.
+    cands = list(range(w, n - w))
+    if len(cands) > 400:
+        # v7.1.3 AUDIT : meme correctif que _scan_max_d, linspace(w, n-w-1), dedup, trie.
+        cands = sorted(set(int(x) for x in np.linspace(w, n - w - 1, 400).astype(int) if w <= int(x) < n - w))
+    best = None
+    for idx in cands:
+        pre, post = target[max(0, idx-w):idx], target[idx:idx+w]
+        if len(pre) < min_group or len(post) < min_group: continue
+        d = cohen_d(pre, post)
+        if not math.isfinite(d): continue
+        if best is None or abs(d) > abs(best["cohen_d"]):
+            best = {"idx": int(idx), "control_value": float(control[idx]), "cohen_d": float(d),
+                    "n_pre": int(len(pre)), "n_post": int(len(post)),
+                    "mean_pre": float(np.mean(pre)), "mean_post": float(np.mean(post)), "window_used": w}
+    if best is None: return {"status": "no_finite_threshold"}
+    idx = best["idx"]
+    # IC + p sur la fenetre locale + effet global + p CORRIGE pour la recherche (decide du grade)
+    d, lo, hi = bootstrap_ci_cohen_d(target[max(0, idx-w):idx], target[idx:idx+w], n_boot=n_boot, seed=seed)
+    p_local = permutation_p_value(target[max(0, idx-w):idx], target[idx:idx+w], n_perm=n_perm, seed=seed)
+    d_global = cohen_d(target[:idx], target[idx:])
+    p_global = permutation_p_value(target[:idx], target[idx:], n_perm=n_perm, seed=seed+7)
+    # v7.1 : le p qui decide du grade est le p corrige scan (le plus conservateur des trois).
+    # Les p local/global sont gardes pour audit, mais ils sont optimistes (seuil choisi puis teste).
+    if compute_scan_p:
+        p_scan_corr, p_scan_null_med, p_scan_null_p95 = scan_corrected_p(
+            control, target, window=window, min_group=min_group,
+            n_perm=int(n_scan_perm), seed=seed+11)
+    else:
+        p_scan_corr, p_scan_null_med, p_scan_null_p95 = float("nan"), float("nan"), float("nan")
+    p_decide = p_scan_corr if math.isfinite(p_scan_corr) else (max(p_local, p_global) if math.isfinite(p_global) else p_local)
+    best.update({"cohen_d_ci_low": float(lo), "cohen_d_ci_high": float(hi),
+                 "p_permutation": float(p_decide),
+                 "p_permutation_local": float(p_local), "p_permutation_global": float(p_global),
+                 "p_permutation_scan_corrected": float(p_scan_corr),
+                 "p_scan_null_median_abs_d": float(p_scan_null_med), "p_scan_null_p95_abs_d": float(p_scan_null_p95),
+                 "cohen_d_global": float(d_global), "status": "ok", "window": int(window)})
+    return best
+
+def cascade_5_thresholds(control, target, central_idx, seed=42, gaussian_sigma=2.0):
+    """Cascade derivee de la cible brute lisse dans le repere du controle.
+    T-2 = extremum |F2| pre-onset; T-1 = extremum |F1| pre-inflexion;
+    T0 = seuil central; T+1 = extremum |F1| post-transition;
+    T+2 = extremum |F2| post-transition. Les absences restent NaN.
+    F1/F2: gradient(y_gaussien, controle), puis gradient(F1, controle).
+    """
+    y=np.asarray(target,dtype=float); x=np.asarray(control,dtype=float); n=len(y)
+    if n<20 or len(x)!=n or central_idx is None or not (0<=int(central_idx)<n):
+        return {"status":"insufficient_data"}
+    derivs=_f1_f2(y,x,gaussian_sigma=gaussian_sigma)
+    f1=np.asarray(derivs["f1"],dtype=float); f2=np.asarray(derivs["f2"],dtype=float)
+    ci=int(central_idx)
+    def _peak(values, lo, hi, order_name):
+        lo=max(0,int(lo)); hi=min(n,int(hi))
+        if hi-lo<3: return {"idx":None,"control_value":float('nan'),"metric_value":float('nan'),"derivative_order":order_name,"note":"segment insuffisant"}
+        ix=np.arange(lo,hi); valid=np.isfinite(values[ix]); ix=ix[valid]
+        if len(ix)==0: return {"idx":None,"control_value":float('nan'),"metric_value":float('nan'),"derivative_order":order_name,"note":"derivee indisponible"}
+        j=int(ix[np.argmax(np.abs(values[ix]))])
+        return {"idx":j,"control_value":float(x[j]),"metric_value":float(values[j]),"absolute_metric":float(abs(values[j])),"derivative_order":order_name}
+    t0={"idx":ci,"control_value":float(x[ci]),"f1_velocity":float(f1[ci]) if math.isfinite(f1[ci]) else float('nan'),
+        "f2_acceleration":float(f2[ci]) if math.isfinite(f2[ci]) else float('nan'),"derivative_order":"F1+F2"}
+    tminus2=_peak(f2,3,ci,"F2"); tminus1=_peak(f1,3,ci,"F1")
+    tplus1=_peak(f1,ci+1,n-3,"F1"); tplus2=_peak(f2,ci+1,n-3,"F2")
+    return {"status":"ok","T_minus2":tminus2,"T_minus1":tminus1,"T0":t0,"T_plus1":tplus1,"T_plus2":tplus2,
+            "derivative_specification":derivs["f1_definition"]+"; "+derivs["f2_definition"],
+            "smoothing":"Gaussian","gaussian_sigma":float(gaussian_sigma),
+            "sigma_status":"valeur explicite de reconstruction; parametre historique exact non present dans v7.1.3"}
+
+# ---------------------------------------------------------------------------
+# FALSIFICATION — P5 : le coeur de l'universalite
+# ---------------------------------------------------------------------------
+def falsification_suite(ds, best_scan, cfg):
+    """Chaque test doit etre passe pour pretendre a un seuil reel.
+    Retourne dict de tests + verdict. Aucun test n'est cache."""
+    rng = np.random.default_rng(cfg.seed)
+    target, control = ds.target, ds.control
+    idx = best_scan.get("idx") if best_scan.get("status") == "ok" else None
+    out = {}
+    # 1. Permutation du controle (casse le lien controle-cible, garde la distribution)
+    if idx is not None:
+        # v7.1.3 AUDIT : l'ancien code generait pc = rng.permutation(control) puis ne
+        # l'utilisait jamais, recalculant 20x le meme |d| observe. Test vide.
+        # Correctif : permuter la cible a coupure fixe. Permuter le controle puis trier
+        # par controle permute equivaut a permuter la cible (argsort d'une permutation
+        # = permutation aleatoire). Si le lien est reel, |d| permute doit s'effondrer.
+        perm_controls = []
+        for _ in range(20):
+            perm_idx = rng.permutation(len(target))
+            target_perm = np.asarray(target, dtype=float)[perm_idx]
+            perm_controls.append(abs(cohen_d(target_perm[:idx], target_perm[idx:])))
+        out["permuted_control_same_cut"] = {"note": "cible permutee a coupure fixe (= controle permute puis trie) : l'effet doit s'effondrer si le lien est reel",
+            "d_observed": float(best_scan["cohen_d"]), "d_permuted_median": float(np.median(perm_controls)) if perm_controls else float("nan")}
+    # 2. Bruit blanc de meme n / meme variance : le pipeline doit dire "rien"
+    # v7.1 : tendance monotone (Spearman controle-cible) — un seuil brut sur tendance est arbitraire
+    try:
+        _rho = float(pd.Series(control).corr(pd.Series(target), method="spearman"))
+    except Exception:
+        _rho = float("nan")
+    out["trend_spearman"] = {"rho_control_target": _rho,
+        "note": "si |rho|>=0.85, le seuil brut est un artefact de tendance : confirmer sur differences, grade cappe a B"}
+    # v7.1.3 AUDIT : l'ancien code utilisait compute_scan_p=False + n_perm=50 pour les nuls.
+    # Le p local a seuil choisi est optimiste, sans correction de scan, donc plus permissif
+    # que le test principal. Maintenant p = p corrige scan, meme n_scan_permutations que le principal.
+    white = rng.normal(np.mean(target), np.std(target), size=len(target))
+    w_scan = scan_threshold(control, white, n_boot=20, n_perm=50, seed=cfg.seed+1, compute_scan_p=True, n_scan_perm=int(getattr(cfg, "n_scan_permutations", 50)))
+    out["white_noise_null"] = {"cohen_d": _safe_float(w_scan.get("cohen_d")), "p_permutation": _safe_float(w_scan.get("p_permutation_scan_corrected")), "p_permutation_local": _safe_float(w_scan.get("p_permutation")),
+        "expected": "p corrige eleve / |d| faible — sinon le detecteur invente des seuils"}
+    # 3. Cible melangee (permutation de la cible) : meme test
+    shuffled = rng.permutation(target)
+    s_scan = scan_threshold(control, shuffled, n_boot=20, n_perm=50, seed=cfg.seed+2, compute_scan_p=True, n_scan_perm=int(getattr(cfg, "n_scan_permutations", 50)))
+    out["shuffled_target_null"] = {"cohen_d": _safe_float(s_scan.get("cohen_d")), "p_permutation": _safe_float(s_scan.get("p_permutation_scan_corrected")), "p_permutation_local": _safe_float(s_scan.get("p_permutation"))}
+    # 4. Split-half : seuil retrouve dans chaque moitie ?
+    half = len(target)//2
+    h1 = scan_threshold(control[:half], target[:half], n_boot=20, n_perm=50, seed=cfg.seed+3, compute_scan_p=True, n_scan_perm=int(getattr(cfg, "n_scan_permutations", 50)))
+    h2 = scan_threshold(control[half:], target[half:], n_boot=20, n_perm=50, seed=cfg.seed+4, compute_scan_p=True, n_scan_perm=int(getattr(cfg, "n_scan_permutations", 50)))
+    out["split_half"] = {"half1_idx": h1.get("idx"), "half1_d": _safe_float(h1.get("cohen_d")), "half1_p_scan_corrected": _safe_float(h1.get("p_permutation_scan_corrected")),
+        "half2_idx": h2.get("idx"), "half2_d": _safe_float(h2.get("cohen_d")), "half2_p_scan_corrected": _safe_float(h2.get("p_permutation_scan_corrected")),
+        "agreement": "les deux moities doivent montrer un effet de meme signe si le seuil est reel"}
+    # 5. Multi-fenetres : stabilite du seuil quand la fenetre change
+    scans = []
+    for w in cfg.window_sizes:
+        s = scan_threshold(control, target, window=w, n_boot=50, n_perm=100, seed=cfg.seed, compute_scan_p=False)
+        if s.get("status") == "ok": scans.append(s["control_value"])
+    out["multi_window"] = {"threshold_values": scans,
+        "stability": float(1.0 - (np.std(scans)/ (np.ptp(control) if np.ptp(control) > 0 else 1.0)) if len(scans) >= 2 else 0.0),
+        "n_windows": len(scans),
+        "note": "1 seule fenetre valide = stabilite NON prouvee (0.0), ne compte pas comme passee" if len(scans) < 2 else "stabilite testee sur plusieurs fenetres"}
+    # 6. Multi-seeds : stabilite du p permutation
+    ps = [permutation_p_value(target[:idx], target[idx:], n_perm=100, seed=cfg.seed+i) if idx is not None else float("nan") for i in range(5)]
+    out["multi_seed_p"] = {"p_values": ps, "p_max": float(np.nanmax(ps)) if len(ps) else float("nan")}
+    # 7. Ablation harmonique (optionnelle) : harmonique vs uniforme, difference rapportee
+    if cfg.harmonic_ablation and idx is not None:
+        # tirage harmonique : on perturbe la cible avec des motifs phi/pi/e (comme v6)
+        # puis on mesure si le seuil survit — si le resultat depend du tirage, il n'est pas robuste.
+        harm_ds = []
+        for trial in range(10):
+            r = np.random.default_rng(cfg.seed+100+trial)
+            jitter = np.zeros_like(target)
+            for i in range(len(target)):
+                if r.random() < cfg.harmonic_prob:
+                    jitter[i] = r.normal(0, 0.05*np.std(target)) * (PHI if trial % 2 == 0 else PI)
+            hs = scan_threshold(control, target+jitter, n_boot=20, n_perm=50, seed=cfg.seed+100+trial, compute_scan_p=False)
+            harm_ds.append(_safe_float(hs.get("cohen_d")))
+        out["harmonic_ablation"] = {"cohen_d_with_harmonic_jitter_median": float(np.nanmedian(harm_ds)) if harm_ds else float("nan"),
+            "cohen_d_observed": float(best_scan["cohen_d"]),
+            "interpretation": "si la mediane s'effondre, le seuil dependait du bruit harmonique — rejeter"}
+    return out
+
+def walk_forward(ds, best_scan, cfg, n_splits=5):
+    """Walk-forward HONNETE v7.1.3.
+    Pour chaque pli, seuil entraine sur le PASSE (scan sur train), teste sur le FUTUR.
+    v7.1.3 AUDIT : l'ancien code avait deux echelles differentes.
+      - Futur des deux cotes : d_test = Cohen-d(pre_futur, post_futur), ecart-type poolé du futur.
+      - Futur d'un seul cote : d_test = (moy_futur - moy_train) / std GLOBAL, seuil absolu 0.5,
+        alors que le commentaire disait 0.5*|d_train|. Incomparable, et plus facile quand |d_train| grand.
+    Correctif : futur d'un seul cote = comparaison Cohen-d futur vs pre-train et futur vs post-train.
+    Succes si le futur est plus proche du cote attendu ET distinguable de l'autre cote (|d|>0.5).
+    Meme definition Cohen-d partout, meme seuil 0.5.
+    Abstentions : un pli dont le train n'a pas de seuil (|d_train|<0.5) ne vote pas, MAIS il est
+    compte. mean_f1 = succes / votes (comme avant). mean_f1_conservative = succes / (votes + abstentions).
+    Le grade exige votes >= 2, sinon WF non credible meme si 1/1.
+    """
+    if best_scan.get("status") != "ok": return {"status": "no_threshold"}
+    n = ds.n
+    edges = np.linspace(0, n, n_splits+1).astype(int)
+    successes, trials, abstentions = 0, 0, 0
+    details = []
+    for s in range(n_splits-1):
+        train_end = edges[s+1]
+        if train_end < 2*cfg.min_group+4: continue
+        train_scan = scan_threshold(ds.control[:train_end], ds.target[:train_end], window=cfg.window_sizes[0] if cfg.window_sizes else 80, n_boot=20, n_perm=50, seed=cfg.seed+s, compute_scan_p=False)
+        if train_scan.get("status") != "ok": continue
+        # ABSTENTION comptee : train sans seuil -> ne vote pas, mais abstention += 1
+        if abs(train_scan.get("cohen_d", 0)) < 0.5:
+            abstentions += 1
+            details.append({"split": s, "abstained": True, "d_train": float(train_scan.get("cohen_d", 0))})
+            continue
+        thr = train_scan["control_value"]; d_train = train_scan["cohen_d"]
+        test_a, test_b = edges[s+1], edges[s+2]
+        if test_b - test_a < 8: continue
+        test_ctrl, test_y = ds.control[test_a:test_b], ds.target[test_a:test_b]
+        train_ctrl, train_y = ds.control[:train_end], ds.target[:train_end]
+        train_pre = train_y[train_ctrl <= thr]
+        train_post = train_y[train_ctrl > thr]
+        mask_post = test_ctrl > thr
+        if mask_post.sum() >= 4 and (~mask_post).sum() >= 4:
+            d_test = cohen_d(test_y[~mask_post], test_y[mask_post])
+            ok = math.isfinite(d_test) and (d_test * d_train > 0) and abs(d_test) > 0.5
+            successes += int(ok); trials += 1
+            details.append({"split": s, "d_train": float(d_train), "d_test": float(d_test), "success": bool(ok), "case": "both_sides"})
+        elif mask_post.sum() >= 4:
+            # Futur entierement post-seuil : doit ressembler au post-train, pas au pre-train.
+            # Cohen-d futur vs chaque cote du train, meme echelle que le cas deux cotes.
+            if len(train_pre) < 4 or len(train_post) < 4: continue
+            d_vs_pre = cohen_d(train_pre, test_y)
+            d_vs_post = cohen_d(train_post, test_y)
+            ok = math.isfinite(d_vs_pre) and math.isfinite(d_vs_post) and abs(d_vs_post) < abs(d_vs_pre) and abs(d_vs_pre) > 0.5
+            successes += int(ok); trials += 1
+            details.append({"split": s, "d_train": float(d_train), "d_test_future_vs_pre": float(d_vs_pre), "d_test_future_vs_post": float(d_vs_post), "success": bool(ok), "case": "future_all_post"})
+        elif (~mask_post).sum() >= 4:
+            if len(train_pre) < 4 or len(train_post) < 4: continue
+            d_vs_pre = cohen_d(train_pre, test_y)
+            d_vs_post = cohen_d(train_post, test_y)
+            ok = math.isfinite(d_vs_pre) and math.isfinite(d_vs_post) and abs(d_vs_pre) < abs(d_vs_post) and abs(d_vs_post) > 0.5
+            successes += int(ok); trials += 1
+            details.append({"split": s, "d_train": float(d_train), "d_test_future_vs_pre": float(d_vs_pre), "d_test_future_vs_post": float(d_vs_post), "success": bool(ok), "case": "future_all_pre"})
+        else:
+            continue
+    total = trials + abstentions
+    if trials == 0:
+        return {"status": "insufficient_splits", "mean_precision": 0.0, "mean_recall": 0.0, "mean_f1": 0.0, "mean_f1_conservative": 0.0, "n_splits_used": 0, "n_abstentions": int(abstentions), "n_splits_total": int(total), "successes": 0, "details": details}
+    f1 = successes / trials
+    f1_cons = successes / total if total > 0 else 0.0
+    return {"status": "ok", "mean_precision": float(f1), "mean_recall": float(f1), "mean_f1": float(f1), "mean_f1_conservative": float(f1_cons), "n_splits_used": trials, "n_abstentions": int(abstentions), "n_splits_total": int(total), "successes": int(successes), "details": details}
+
+
+# ---------------------------------------------------------------------------
+# L1..L7 UNIVERSELS — poids appris, jamais fixes par domaine
+# ---------------------------------------------------------------------------
+def _stability_weight(values):
+    """Poids = 1/(1+CV). Valeurs stables -> poids fort. Vide -> 0."""
+    v = np.array([x for x in values if math.isfinite(x)], dtype=float)
+    if len(v) < 2: return 1.0
+    sd = np.std(v); m = abs(np.mean(v))
+    if m == 0: return 0.5
+    cv = sd / m
+    return float(1.0 / (1.0 + cv))
+
+def compute_interactions(ds, cascade, cfg):
+    """v7.1 L7_INTERACTIONS : convergence ET divergence, sans consensus force.
+    Pour chaque flux, les 21 fonctions distinctes (29 noms, 8 alias dedup) sont recalculees SUR CHAQUE SEGMENT d'une grille FIXE autour de T0
+    (6 segments max : T0-2w, T0-w, T0, T0+w, T0+2w, avec w=n//10). Grille fixe = profils comparables.
+    Un estimateur muet globalement peut etre tres informatif sur un seul segment.
+    Sortie : profils par segment, cartes convergence / divergence, paires complementaires.
+    Aucune probabilite, aucun consensus force, aucun chiffre unique qui ecrase le reste."""
+    n = ds.n
+    # v7.1.1 GRILLE FIXE AUTOUR DE T0, pas cascade.
+    # Constat teste : les pics de cascade T-2/T-1/T+1/T+2 sont instables d'une seed a l'autre
+    # (seed 4 : 2 segments seulement, seed 3 : segment de 12 points). Comparer des profils
+    # sur des grilles differentes est impossible. La grille fixe autour de T0 (stable)
+    # donne 6 segments comparables : avant loin, avant proche, autour, apres proche, apres loin.
+    # La cascade reste dans le resultat pour audit, mais elle ne definit plus la grille L7.
+    t0_idx = None
+    if isinstance(cascade, dict):
+        v0 = cascade.get("T0", {})
+        if isinstance(v0, dict) and v0.get("idx") is not None and math.isfinite(v0.get("idx", float("nan"))):
+            t0_idx = int(v0["idx"])
+    if t0_idx is None:
+        # sans T0, pas de grille L7
+        return {"status": "insufficient_data", "segments": [], "per_flux": {},
+                "summary": {"n_segments": 0, "n_fluxes": 0, "total_complementary_pairs": 0,
+                            "definition": "pas de T0, pas de grille L7"}}
+    w = max(20, n//10)
+    bidx = sorted(set([b for b in [t0_idx-2*w, t0_idx-w, t0_idx+w, t0_idx+2*w] if 0 < b < n]))
+    min_sep = max(10, n//20)
+    kept = []
+    for b in bidx:
+        if not kept or (b - kept[-1] >= min_sep and n - b >= min_sep):
+            kept.append(b)
+    bidx = kept
+    bounds = [0] + bidx + [n]
+    # segments : (start, end, position vs T0)
+    segments = []
+    for s in range(len(bounds)-1):
+        a, b = bounds[s], bounds[s+1]
+        if b <= a: continue
+        if t0_idx is None: pos = "unknown"
+        elif b <= t0_idx: pos = "pre_T0"
+        elif a >= t0_idx: pos = "post_T0"
+        else: pos = "at_T0"
+        segments.append({"segment": s, "start_idx": int(a), "end_idx": int(b), "length": int(b-a),
+                         "control_start": float(ds.control[a]), "control_end": float(ds.control[b-1]),
+                         "position": pos})
+    per_flux = {}
+    total_pairs = 0
+    for fname in ds.flux_names:
+        win_vals = []  # par segment : liste des dicts estimateurs par fenetre
+        series = ds.fluxes[fname]
+        # v7.1.4 : longueur adaptative, mais chaque estimateur garde son statut de validite.
+        # Une fenetre trop courte ne doit pas produire de faux zero ni un profil artificiel.
+        W = min(128, max(40, len(series)//12))
+        est_per_seg = []
+        for seg in segments:
+            seg_series = series[seg["start_idx"]:seg["end_idx"]]
+            if len(seg_series) < W:
+                est_per_seg.append({name: float("nan") for name, _, _ in UNIQUE_ESTIMATORS})
+                win_vals.append([])
+                continue
+            # fenetres GLISSANTES pas 5 (plus de fenetres par segment, sinon 2-4 fenetres = Cohen-d bruit)
+            windows = [seg_series[i:i+W] for i in range(0, len(seg_series)-W+1, 5)]
+            per_win = [apply_estimators(w) for w in windows]
+            med = {}
+            # v7.1.3 : profils sur fonctions distinctes (21), pas 29 noms (alias = double-compte).
+            for name, _, _ in UNIQUE_ESTIMATORS:
+                vals = [d.get(name, float("nan")) for d in per_win]
+                vals = [v for v in vals if math.isfinite(v)]
+                med[name] = float(np.median(vals)) if vals else float("nan")
+            est_per_seg.append(med)
+            win_vals.append(per_win)
+        # profils par estimateur (fonctions distinctes, v7.1.3)
+        profiles = {}
+        for name, _, _ in UNIQUE_ESTIMATORS:
+            vals = [est_per_seg[s].get(name, float("nan")) for s in range(len(segments))]
+            finite = [v for v in vals if math.isfinite(v)]
+            if len(finite) < 2:
+                profiles[name] = {"values_per_segment": vals, "median_across_segments": float("nan"),
+                                  "informativeness_per_segment": [float("nan")]*len(segments),
+                                  "peak_segment": None, "peak_informativeness": float("nan"),
+                                  "delta_post_minus_pre": float("nan"), "sign_post_minus_pre": "unknown"}
+                continue
+            med = float(np.median(finite))
+            # v7.1 informativeness = |Cohen-d| entre les fenetres du segment et les fenetres des autres segments.
+            # Ca utilise la variation INTRA-segment : un estimateur qui varie autant dans un segment que
+            # entre segments n'est pas informatif, meme si sa mediane bouge sur 3 points.
+            infos = []
+            for s_idx in range(len(segments)):
+                seg_win = [d.get(name, float("nan")) for d in (win_vals[s_idx] if s_idx < len(win_vals) else [])]
+                seg_win = [v for v in seg_win if math.isfinite(v)]
+                oth_win = []
+                for o_idx in range(len(segments)):
+                    if o_idx == s_idx: continue
+                    oth_win += [d.get(name, float("nan")) for d in (win_vals[o_idx] if o_idx < len(win_vals) else [])]
+                oth_win = [v for v in oth_win if math.isfinite(v)]
+                if len(seg_win) >= 3 and len(oth_win) >= 5:
+                    # v7.1 : informativeness seulement si l'IC bootstrap du Cohen-d exclut 0.
+                    # Avec 3-5 fenetres, un Cohen-d seul est du bruit ; l'IC large tue les faux positifs.
+                    d_seg, lo_seg, hi_seg = bootstrap_ci_cohen_d(np.array(oth_win), np.array(seg_win), n_boot=100, seed=42)
+                    if math.isfinite(d_seg) and math.isfinite(lo_seg) and math.isfinite(hi_seg) and (lo_seg > 0 or hi_seg < 0):
+                        infos.append(abs(d_seg))
+                    else:
+                        infos.append(0.0)
+                else:
+                    infos.append(float("nan"))
+            finite_infos = [x for x in infos if math.isfinite(x)]
+            peak = int(int(np.nanargmax(np.array([x if math.isfinite(x) else -1 for x in infos])))) if finite_infos else None
+            # delta post - pre : segments post vs pre (at_T0 exclus)
+            pre_vals = [vals[s] for s, seg in enumerate(segments) if seg["position"] == "pre_T0" and math.isfinite(vals[s])]
+            post_vals = [vals[s] for s, seg in enumerate(segments) if seg["position"] == "post_T0" and math.isfinite(vals[s])]
+            delta = float(np.mean(post_vals)-np.mean(pre_vals)) if pre_vals and post_vals else float("nan")
+            sign = "up" if delta > 0 else ("down" if delta < 0 else "flat") if math.isfinite(delta) else "unknown"
+            profiles[name] = {"values_per_segment": vals, "median_across_segments": med,
+                              "informativeness_per_segment": infos,
+                              "peak_segment": peak,
+                              "peak_informativeness": float(max(finite_infos)) if finite_infos else float("nan"),
+                              "delta_post_minus_pre": delta, "sign_post_minus_pre": sign}
+        # convergence : signes post-pre
+        signs = [pr["sign_post_minus_pre"] for pr in profiles.values() if pr["sign_post_minus_pre"] in ("up", "down")]
+        n_up = sum(1 for s in signs if s == "up"); n_down = sum(1 for s in signs if s == "down")
+        majority = "up" if n_up >= n_down else "down" if signs else "unknown"
+        frac_maj = (max(n_up, n_down)/len(signs)) if signs else 0.0
+        # divergence : pics dans des segments differents
+        peaks = [pr["peak_segment"] for pr in profiles.values() if pr["peak_segment"] is not None]
+        n_distinct_peaks = len(set(peaks)) if peaks else 0
+        top_div = sorted([(name, pr["peak_segment"], pr["peak_informativeness"]) for name, pr in profiles.items()
+                          if pr["peak_segment"] is not None and math.isfinite(pr["peak_informativeness"])],
+                         key=lambda x: x[2], reverse=True)[:5]
+        # v7.1 paires complementaires GENERALISEES : deux estimateurs dont les pics sont dans
+        # des segments DIFFERENTS, tous deux informatifs |Cohen-d| >= 0.8. Pas seulement pre/post :
+        # pour une marche nette, le signal est dans le segment at_T0, pas pre/post.
+        # La paire est ordonnee par segment de pic croissant (loupe precoce, loupe tardive).
+        pairs = []
+        _pos = {s: seg["position"] for s, seg in enumerate(segments)}
+        for a_name, a_pr in profiles.items():
+            if a_pr["peak_segment"] is None: continue
+            if not math.isfinite(a_pr["peak_informativeness"]) or a_pr["peak_informativeness"] < 0.8: continue
+            for b_name, b_pr in profiles.items():
+                if b_name == a_name: continue
+                if b_pr["peak_segment"] is None: continue
+                if b_pr["peak_segment"] <= a_pr["peak_segment"]: continue  # ordonne, evite les doublons
+                if not math.isfinite(b_pr["peak_informativeness"]) or b_pr["peak_informativeness"] < 0.8: continue
+                pairs.append({"estimator_a": a_name, "estimator_b": b_name,
+                              "peak_segment_a": int(a_pr["peak_segment"]), "peak_segment_b": int(b_pr["peak_segment"]),
+                              "position_a": _pos.get(a_pr["peak_segment"]), "position_b": _pos.get(b_pr["peak_segment"]),
+                              "informativeness_a": float(a_pr["peak_informativeness"]),
+                              "informativeness_b": float(b_pr["peak_informativeness"]),
+                              "min_informativeness": float(min(a_pr["peak_informativeness"], b_pr["peak_informativeness"])),
+                              # alias pre/post quand la paire est exactement pre/post (compatibilite)
+                              "estimator_pre": a_name if _pos.get(a_pr["peak_segment"]) == "pre_T0" and _pos.get(b_pr["peak_segment"]) == "post_T0" else None,
+                              "estimator_post": b_name if _pos.get(a_pr["peak_segment"]) == "pre_T0" and _pos.get(b_pr["peak_segment"]) == "post_T0" else None})
+        pairs = sorted(pairs, key=lambda x: x["min_informativeness"], reverse=True)[:10]
+        total_pairs += len(pairs)
+        # top par segment
+        per_seg_top = {}
+        for s, seg in enumerate(segments):
+            cand = sorted([(name, pr["informativeness_per_segment"][s]) for name, pr in profiles.items()
+                           if len(pr["informativeness_per_segment"]) > s and math.isfinite(pr["informativeness_per_segment"][s])],
+                          key=lambda x: x[1], reverse=True)[:5]
+            per_seg_top[f"segment_{s}"] = [{"estimator": nm, "informativeness": float(v)} for nm, v in cand]
+        per_flux[fname] = {"profiles": profiles,
+                           "convergence": {"n_up": int(n_up), "n_down": int(n_down), "majority_sign": majority,
+                                           "fraction_majority": float(frac_maj),
+                                           "note": "convergence = comptage, pas consensus force : la divergence ci-dessous est aussi un signal"},
+                           "divergence": {"n_distinct_peak_segments": int(n_distinct_peaks),
+                                          "top_divergent": [{"estimator": nm, "peak_segment": int(ps), "peak_informativeness": float(v)} for nm, ps, v in top_div]},
+                           "complementary_pairs": pairs,
+                           "per_segment_top": per_seg_top}
+    return {"status": "ok", "segments": segments, "per_flux": per_flux,
+            "summary": {"n_segments": len(segments), "n_fluxes": len(ds.flux_names),
+                        "n_estimators_distinct": len(UNIQUE_ESTIMATORS), "n_estimator_names": len(ESTIMATORS), "total_complementary_pairs": int(total_pairs),
+                        "definition": "convergence et divergence sont deux signaux. Ne jamais moyenner les loupes."}}
+
+def level_universal(ds, best_scan, cascade, est_by_flux, cfg):
+    """Calcule L1..L7 avec ponderation par stabilite, pas par domaine."""
+    target, control = ds.target, ds.control
+    L = {}
+    # L1 Direction : signe empirique de Cohen-d (P3). Aucun lexique.
+    if best_scan.get("status") == "ok":
+        d = best_scan["cohen_d"]
+        direction = "up" if d > 0.05 else ("down" if d < -0.05 else "flat")
+        # multi-horizons : direction a chaque horizon (decalage de la coupure)
+        horizon_dirs = []
+        for h in cfg.horizons:
+            idx_h = int(np.clip(best_scan["idx"] + h, cfg.min_group, len(target)-cfg.min_group-1))
+            dh = cohen_d(target[:idx_h], target[idx_h:])
+            if math.isfinite(dh): horizon_dirs.append(dh)
+        stab = _stability_weight(horizon_dirs)
+        L["L1_direction"] = {"status": "ok", "direction": direction, "cohen_d": float(d),
+            "ci_low": best_scan.get("cohen_d_ci_low"), "ci_high": best_scan.get("cohen_d_ci_high"),
+            "p_permutation": best_scan.get("p_permutation"), "confidence": float(stab),
+            "multi_horizon": {"horizons": cfg.horizons, "cohen_d_by_horizon": horizon_dirs, "stability": float(stab)},
+            "definition": "direction = signe(Cohen-d post-pre). Renommer une colonne ne change rien."}
+    else:
+        L["L1_direction"] = {"status": "insufficient_data"}
+    # L2 Magnitude : |d| + ecart des moyennes en unites de la cible
+    if best_scan.get("status") == "ok":
+        L["L2_magnitude"] = {"status": "ok", "abs_cohen_d": float(abs(best_scan["cohen_d"])),
+            "mean_pre": best_scan["mean_pre"], "mean_post": best_scan["mean_post"],
+            "relative_change": float((best_scan["mean_post"]-best_scan["mean_pre"]) / (abs(best_scan["mean_pre"]) if best_scan["mean_pre"] != 0 else 1.0)),
+            "confidence": float(_stability_weight([best_scan["cohen_d"]]))}
+    else: L["L2_magnitude"] = {"status": "insufficient_data"}
+    # L3 Regime : pre / transition / post selon position relative au seuil
+    if best_scan.get("status") == "ok":
+        # regime = ou se situe la fin de la serie par rapport au seuil
+        frac_post = float(np.mean(control > best_scan["control_value"]))
+        state = "pre" if frac_post < 0.15 else ("post" if frac_post > 0.85 else "transition")
+        L["L3_regime"] = {"status": "ok", "state": state, "fraction_post_threshold": frac_post,
+            "confidence": float(_stability_weight([frac_post]))}
+    else: L["L3_regime"] = {"status": "insufficient_data"}
+    # v7.1 L4 FORCE DU SIGNAL : pas de risque, pas de 1-p, pas de pseudo-probabilite.
+    # On garde |d| brut + p corrige scan. Le grade utilise ces deux nombres, rien d'autre.
+    if best_scan.get("status") == "ok":
+        p_corr = best_scan.get("p_permutation_scan_corrected", best_scan.get("p_permutation", float("nan")))
+        level = "fort" if abs(best_scan["cohen_d"]) > 1.0 and math.isfinite(p_corr) and p_corr <= 0.05 else ("modere" if abs(best_scan["cohen_d"]) > 0.5 else "faible")
+        L["L4_signal"] = {"status": "ok", "level": level, "abs_cohen_d": float(abs(best_scan["cohen_d"])),
+            "p_permutation_scan_corrected": float(p_corr) if math.isfinite(p_corr) else float("nan"),
+            "p_permutation_local": best_scan.get("p_permutation_local"), "p_permutation_global": best_scan.get("p_permutation_global"),
+            "definition": "force du signal = |Cohen-d| + p corrige scan. Pas un risque, pas une probabilite de prediction."}
+        # alias historique : meme contenu, pour ne pas casser les lecteurs de L4_risk
+        L["L4_risk"] = dict(L["L4_signal"]); L["L4_risk"]["note_alias"] = "alias de L4_signal, lire L4_signal"
+    else:
+        L["L4_signal"] = {"status": "insufficient_data", "level": "unknown"}
+        L["L4_risk"] = {"status": "insufficient_data", "level": "unknown"}
+    # L5 Complexite : dispersion des estimateurs entre flux + T_log median
+    all_est = []
+    for fname, est in est_by_flux.items():
+        vals = [v for v in est.values() if math.isfinite(v)]
+        all_est.extend(vals)
+    tlog = compute_tlog(est_by_flux.get(ds.target_name, {}), ds.n)
+    alerts = []
+    if tlog.get("t_log") is not None and math.isfinite(tlog.get("t_log", float("nan"))) and abs(tlog["t_log"]) > 2*math.log(max(ds.n, 2)):
+        alerts.append("t_log_ecarte_de_zero")
+    L["L5_complexity"] = {"status": "ok", "t_log": tlog, "n_estimators_evaluated": len(ESTIMATORS),
+        "alerts": alerts, "confidence": float(_stability_weight(all_est) if all_est else 0.0),
+        "note": "T_log est un diagnostic, pas une preuve. Les 29 estimateurs ne servent PAS au seuil, PAS au p, PAS a la prediction. Diagnostic seul."}
+    # v7.1 L6 : PREDICTION HORS DU COEUR. Aucune extrapolation d'ecart de cascade.
+    # La prediction vit dans predict_universal(), verrouillee, jamais dans analyze().
+    L["L6_prediction"] = {"status": "disabled_in_core",
+        "note": "prediction hors du coeur analyse. Voir predict_universal() : refuse tant que les conditions ne sont pas remplies."}
+    L["L6_next_threshold"] = {"status": "disabled_in_core", "predicted_next_control_value": float("nan"),
+        "note": "extrapolation d'ecart supprimee en v7.1 : elle supposait des seuils periodiques sans base."}
+    # v7.1 L7 INTERACTIONS : convergence ET divergence, sans consensus force.
+    # Les 29 estimateurs sont recalcules par segment de cascade : chaque loupe peut s'allumer a un moment different.
+    try:
+        L["L7_interactions"] = compute_interactions(ds, cascade, cfg)
+    except Exception as e:
+        L["L7_interactions"] = {"status": "error", "error": str(e)}
+    # alias historique : L7_coherence ne contient PLUS de probabilites ni de consensus.
+    # On garde la cle pour compatibilite, avec le resume interactions et aucune pseudo-probabilite.
+    if isinstance(L.get("L7_interactions"), dict) and L["L7_interactions"].get("status") == "ok":
+        _summ = L["L7_interactions"]["summary"]
+        L["L7_coherence"] = {"status": "ok", "note": "remplace en v7.1 par L7_interactions : pas de probabilites, pas de consensus force",
+            "total_complementary_pairs": _summ.get("total_complementary_pairs"),
+            "n_segments": _summ.get("n_segments")}
+    else:
+        L["L7_coherence"] = {"status": "insufficient_data"}
+    return L
+
+def grade_evidence(best_scan, falsif, wf, cfg):
+    """Grade declare : A = fort, B = modere, C = faible, D = pas de preuve.
+    Grade = preuve du SEUIL, pas preuve d'une prediction.
+    Le p qui decide est le p corrige scan (best_scan p_permutation). Regles dans cfg.grade_rules."""
+    rules = cfg.grade_rules
+    if best_scan.get("status") != "ok":
+        return {"grade": "D", "verdict": "pas de preuve — aucun seuil fini", "reasons": ["scan sans seuil"]}
+    reasons = []
+    ok_d = abs(best_scan["cohen_d"]) >= rules["min_cohen_d"]
+    ok_p = math.isfinite(best_scan.get("p_permutation", float("nan"))) and best_scan["p_permutation"] <= rules["max_p_perm"]
+    stab = falsif.get("multi_window", {}).get("stability", 0.0)
+    ok_stab = stab >= rules["min_stability"]
+    wf_f1 = wf.get("mean_f1", 0.0) if isinstance(wf, dict) else 0.0
+    # v7.1.3 AUDIT : 1/1 ne vaut rien si 3 plis ont abstenu. WF credible exige >=2 votes.
+    wf_votes = wf.get("n_splits_used", 0) if isinstance(wf, dict) else 0
+    ok_wf = (wf_f1 >= rules["min_walkforward_f1"]) and (wf_votes >= 2)
+    if not ok_d: reasons.append(f"|Cohen-d|={abs(best_scan['cohen_d']):.2f} < {rules['min_cohen_d']}")
+    if not ok_p: reasons.append(f"p_perm={best_scan.get('p_permutation')} > {rules['max_p_perm']}")
+    if not ok_stab: reasons.append(f"stabilite multi-fenetres={stab:.2f} < {rules['min_stability']}")
+    if not ok_wf:
+        if wf_votes < 2: reasons.append(f"walk-forward : seulement {wf_votes} pli(s) vote(s), il faut >=2 (abstentions={wf.get('n_abstentions', 0) if isinstance(wf, dict) else 0})")
+        else: reasons.append(f"walk-forward F1={wf_f1:.2f} < {rules['min_walkforward_f1']}")
+    # le nul bruit blanc doit echouer a trouver un seuil fort — 5e check, pas une remarque.
+    wn = falsif.get("white_noise_null", {})
+    ok_white = True
+    if math.isfinite(wn.get("cohen_d", float("nan"))) and math.isfinite(best_scan.get("cohen_d", float("nan"))):
+        ok_white = abs(wn["cohen_d"]) < 0.5 * abs(best_scan["cohen_d"])
+        if not ok_white:
+            reasons.append("le nul bruit blanc trouve un effet comparable — detecteur non specifique")
+    # Bordure deja exclue dans scan_threshold (fenetre complete exigee) : rien a penaliser ici.
+    n_ok = sum([ok_d, ok_p, ok_stab, ok_wf, ok_white])
+    grade = "A" if n_ok == 5 and not reasons else ("B" if n_ok == 4 else ("C" if n_ok == 3 else "D"))
+    # v7.1 cap tendance : |Spearman|>=0.85 => seuil brut arbitraire, jamais mieux que B, confirmer sur differences
+    rho = falsif.get("trend_spearman", {}).get("rho_control_target", float("nan")) if isinstance(falsif, dict) else float("nan")
+    trend_cap = math.isfinite(rho) and abs(rho) >= 0.85
+    if trend_cap:
+        reasons.append(f"tendance monotone forte Spearman rho={rho:.2f} — seuil brut peut etre artefact de tendance, confirmer sur differences")
+        if grade == "A":
+            grade = "B"
+    # cap : si le nul est non specifique, jamais mieux que C meme si les autres checks passent
+    if not ok_white and grade in ("A", "B"):
+        grade = "C"
+    verdict = {"A": "preuve forte (au sens de ce protocole — replication independante requise)",
+               "B": "preuve moderee", "C": "preuve faible — ne pas decider dessus",
+               "D": "pas de preuve — ne pas annoncer de seuil"}[grade]
+    return {"grade": grade, "verdict": verdict, "reasons": reasons,
+            "checks": {"cohen_d_ok": ok_d, "p_perm_ok": ok_p, "stability_ok": ok_stab, "walkforward_ok": ok_wf, "white_null_ok": ok_white},
+            "n_checks_passed": int(n_ok)}
+
+
+# ---------------------------------------------------------------------------
+# ANALYSE PRINCIPALE — point d'entree unique
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v7.1.4 : VALIDATION DES TRAJECTOIRES DES 29 ESTIMATEURS
+# Les quatre definitions ci-dessous sont des operationalisations PROVISOIRES.
+# Les formulations exactes de la version historique Step 1-4 n'etaient pas
+# presentes dans le fichier source fourni : elles ne sont donc pas pretendues
+# identiques aux tests originaux sans leurs formules/seuils de reference.
+# ---------------------------------------------------------------------------
+
+def _rolling_estimator_trajectories(series, window, step=5, coordinate=None, return_coordinates=False):
+    """Trajectoires glissantes des 29 noms, sans imputation des NaN.
+    Les centres de fenetres sont retournes en option pour les derivees F1/F2.
+    """
+    x = np.asarray(series, dtype=float)
+    c = np.arange(len(x), dtype=float) if coordinate is None else np.asarray(coordinate, dtype=float)
+    if len(c) != len(x):
+        raise ValueError("coordinate doit avoir la meme longueur que series")
+    if window < 8 or len(x) < window:
+        empty = {name: np.array([], dtype=float) for name, _, _ in ESTIMATORS}
+        return (empty, np.array([], dtype=float)) if return_coordinates else empty
+    rows, centers = [], []
+    for i in range(0, len(x)-window+1, max(1, step)):
+        rows.append(apply_estimators(x[i:i+window]))
+        cc = c[i:i+window]
+        centers.append(float(np.nanmean(cc)) if np.isfinite(cc).any() else float('nan'))
+    trajectories = {name: np.asarray([r.get(name, np.nan) for r in rows], dtype=float)
+                    for name, _, _ in ESTIMATORS}
+    centers = np.asarray(centers, dtype=float)
+    return (trajectories, centers) if return_coordinates else trajectories
+
+
+def _step1_white_noise_q5(y, seed=42, n_perm=199):
+    y = _finite(y)
+    if len(y) < 8 or np.std(y) == 0: return {"status":"insufficient_or_constant", "statistic":float('nan'), "p_value":float('nan')}
+    obs = float(np.corrcoef(y[:-1], y[1:])[0,1])
+    rng = np.random.default_rng(seed); null = []
+    for _ in range(n_perm):
+        z = rng.permutation(y); null.append(float(np.corrcoef(z[:-1],z[1:])[0,1]))
+    lo, hi = np.quantile(null, [0.025,0.975])
+    return {"status":"ok", "statistic":obs, "null_q025":float(lo), "null_q975":float(hi), "p_value":float((1+sum(abs(v)>=abs(obs) for v in null))/(n_perm+1)), "flag":bool(obs<lo or obs>hi), "definition":"Q5 provisoire: autocorrelation lag-1 contre permutation"}
+
+
+def _step2_local_volatility(y):
+    y = _finite(y)
+    if len(y) < 8 or np.std(y, ddof=1)==0: return {"status":"insufficient_or_constant", "ratio":float('nan'), "flag":None}
+    w=max(3,len(y)//4); local=[np.std(y[i:i+w],ddof=1) for i in range(0,len(y)-w+1,max(1,w//2))]
+    ratio=float(np.max(local)/np.std(y,ddof=1)) if local else float('nan')
+    return {"status":"ok", "ratio":ratio, "flag":bool(ratio>1.5), "definition":"volatilite locale max / volatilite globale; seuil 1.5 provisoire"}
+
+
+def _step3_hurst_drift(y):
+    y = _finite(y)
+    if len(y)<20 or np.std(y)==0: return {"status":"insufficient_or_constant", "hurst":float('nan'), "drift":float('nan')}
+    h=est_hurst_rs(y); t=np.arange(len(y),dtype=float); drift=float(np.polyfit(t,y,1)[0])
+    return {"status":"ok" if math.isfinite(h) else "insufficient", "hurst_rs":h, "linear_drift":drift, "definition":"Hurst R/S + pente lineaire; diagnostic conjoint provisoire"}
+
+
+def _step4_fft_spectral(y):
+    y=_finite(y)
+    if len(y)<16 or np.std(y)==0: return {"status":"insufficient_or_constant", "spectral_entropy":float('nan'), "dominant_fraction":float('nan')}
+    p=np.abs(np.fft.rfft(y-np.mean(y)))**2
+    if len(p)>0: p[0]=0
+    p=p[p>0]
+    if len(p)<2: return {"status":"insufficient", "spectral_entropy":float('nan'), "dominant_fraction":float('nan')}
+    q=p/p.sum(); ent=float(-np.sum(q*np.log(q))/math.log(len(q))); dom=float(np.max(q))
+    return {"status":"ok", "spectral_entropy":ent, "dominant_fraction":dom, "definition":"entropie spectrale FFT + fraction de puissance dominante"}
+
+
+def _four_noise_tests(y, seed=42):
+    """Les quatre diagnostics historiques restent separes et ordonnes Step 1..4.
+    Leurs noms sont retrouves, mais leurs seuils/formules exacts historiques ne sont
+    pas tous specifiables a partir du fichier v7.1.3; les implementations portent
+    donc explicitement le statut operationnel provisoire.
+    """
+    return {"step1_white_noise_q5":_step1_white_noise_q5(y,seed), "step2_local_volatility":_step2_local_volatility(y), "step3_hurst_drift":_step3_hurst_drift(y), "step4_fft_spectral":_step4_fft_spectral(y)}
+
+
+def _gaussian_smooth_finite(y, sigma=2.0, truncate=4.0):
+    """Lissage gaussien sur les points finis; aucun remplissage des valeurs manquantes."""
+    a=np.asarray(y,dtype=float); out=np.full(a.shape,np.nan,dtype=float)
+    good=np.isfinite(a)
+    if good.sum()==0: return out
+    # Chaque bloc fini est traite separement afin de ne pas lisser a travers un trou.
+    ids=np.flatnonzero(good); cuts=np.where(np.diff(ids)>1)[0]+1
+    for block in np.split(ids,cuts):
+        vals=a[block]
+        if len(vals)==1: out[block]=vals; continue
+        radius=max(1,int(truncate*float(sigma)))
+        grid=np.arange(-radius,radius+1,dtype=float)
+        kernel=np.exp(-0.5*(grid/float(sigma))**2); kernel/=kernel.sum()
+        pad=np.pad(vals,(radius,radius),mode='reflect')
+        out[block]=np.convolve(pad,kernel,mode='valid')
+    return out
+
+
+def _f1_f2(y, p_coord=None, gaussian_sigma=2.0):
+    """F1=d(y_lisse)/d(p_coord), F2=d(F1)/d(p_coord), sur cible brute lisse.
+    Les axes constants sont conserves: F1/F2 valent zero si y est constant et
+    p_coord est strictement croissant; aucune division par zero n'est forcee.
+    """
+    a=np.asarray(y,dtype=float); x=np.arange(len(a),dtype=float) if p_coord is None else np.asarray(p_coord,dtype=float)
+    if len(x)!=len(a): raise ValueError("p_coord et y doivent avoir la meme longueur")
+    smooth=_gaussian_smooth_finite(a,sigma=gaussian_sigma)
+    f1=np.full(a.shape,np.nan); f2=np.full(a.shape,np.nan)
+    good=np.isfinite(smooth)&np.isfinite(x)
+    ids=np.flatnonzero(good); cuts=np.where(np.diff(ids)>1)[0]+1 if len(ids) else []
+    for block in np.split(ids,cuts) if len(ids) else []:
+        if len(block)<2: continue
+        xb=x[block]
+        if np.any(np.diff(xb)<=0):
+            # Coordonnees non strictement croissantes: derivation indefinie, on conserve NaN.
+            continue
+        f1b=np.gradient(smooth[block],xb,edge_order=1)
+        f1[block]=f1b
+        if len(block)>=3: f2[block]=np.gradient(f1b,xb,edge_order=1)
+    finite1=f1[np.isfinite(f1)]; finite2=f2[np.isfinite(f2)]
+    return {"status":"ok" if len(finite1)>=2 else "insufficient_data", "gaussian_sigma":float(gaussian_sigma),
+            "smoothing":"Gaussian, finite contiguous blocks only", "f1_definition":"gradient(y_smooth, p_coord)",
+            "f2_definition":"gradient(F1, p_coord)", "f1":f1.tolist(), "f2":f2.tolist(),
+            "f1_mean":float(np.mean(finite1)) if len(finite1) else float('nan'),
+            "f1_std":float(np.std(finite1)) if len(finite1) else float('nan'),
+            "f2_mean":float(np.mean(finite2)) if len(finite2) else float('nan'),
+            "f2_std":float(np.std(finite2)) if len(finite2) else float('nan'),
+            "n_finite_f1":int(len(finite1)), "n_finite_f2":int(len(finite2))}
+
+
+def monte_carlo_estimators(series, n_paths=200, seed=42, window=80):
+    """MC uniforme pour les 29 estimateurs sur une cohorte donnee.
+    Chaque trajectoire a sa graine deterministe; les tirages MC ne sont JAMAIS
+    traites comme une serie temporelle. Les valeurs individuelles sont conservees.
+    La perturbation est un bruit gaussien calibre par MAD des differences finies.
+    Ce protocole est une reconstruction operationnelle, pas la preuve d'un ancien
+    protocole de pondération/segmentation non documente dans le fichier v7.1.3.
+    """
+    x=np.asarray(series,dtype=float); finite=_finite(x)
+    if len(finite)<max(20,window//2): return {"status":"insufficient_data", "estimators":{}, "n_paths":0, "seed":int(seed)}
+    dif=np.diff(finite); scale=float(1.4826*np.median(np.abs(dif-np.median(dif)))/math.sqrt(2)) if len(dif) else 0.0
+    if not math.isfinite(scale): scale=0.0
+    results={name:[] for name,_,_ in ESTIMATORS}; seeds=[]
+    for k in range(max(200,int(n_paths))):
+        path_seed=int(np.random.SeedSequence([int(seed),k]).generate_state(1)[0]); seeds.append(path_seed)
+        rng=np.random.default_rng(path_seed)
+        perturbed=x.copy(); mask=np.isfinite(perturbed)
+        if scale>0: perturbed[mask]=perturbed[mask]+rng.normal(0,scale,size=int(mask.sum()))
+        est=apply_estimators(perturbed)
+        for name,_,_ in ESTIMATORS: results[name].append(est.get(name,np.nan))
+    out={}
+    for name,vals in results.items():
+        a=np.asarray(vals,dtype=float); f=a[np.isfinite(a)]
+        out[name]={"mean":float(np.mean(f)) if len(f) else float('nan'),
+                   "std":float(np.std(f,ddof=1)) if len(f)>1 else float('nan'),
+                   "median":float(np.median(f)) if len(f) else float('nan'),
+                   "q05":float(np.quantile(f,.05)) if len(f) else float('nan'),
+                   "q95":float(np.quantile(f,.95)) if len(f) else float('nan'),
+                   "valid_fraction":float(len(f)/len(a)), "n_valid":int(len(f)), "n_total":int(len(a)),
+                   "samples":a.tolist()}
+    return {"status":"ok", "method":"uniform input-perturbation MC; segmented cohorts; not a reconstructed legacy weighting scheme",
+            "n_paths":len(seeds), "seed":int(seed), "path_seeds":seeds, "noise_scale_mad_diff":scale,
+            "weighting":"equal weight per Monte-Carlo path", "estimators":out, "draw_order_is_not_time":True}
+
+
+def _cohort_validation(series, seed, n_mc_paths, window, coordinate=None, threshold_coord=None, gaussian_sigma=2.0):
+    x=np.asarray(series,dtype=float); n=len(x)
+    coord=np.arange(n,dtype=float) if coordinate is None else np.asarray(coordinate,dtype=float)
+    win=max(20,min(int(window),max(20,n//3)))
+    step=max(1,win//6)
+    # Ordre de protocole explicite: MC initial de la cohorte, puis Step 1-4, puis F1/F2.
+    mc=monte_carlo_estimators(x,n_paths=n_mc_paths,seed=seed,window=win)
+    trajs, centers=_rolling_estimator_trajectories(x,win,step=step,coordinate=coord,return_coordinates=True)
+    by_est={}
+    for i,(name,_,_) in enumerate(ESTIMATORS):
+        tr=trajs[name]
+        tests=_four_noise_tests(tr,seed+1009*i)
+        deriv=_f1_f2(tr,centers,gaussian_sigma=gaussian_sigma)
+        by_est[name]={"n_trajectory_points":int(len(tr)), "tests":tests, "f1_f2":deriv,
+                      "trajectory":tr.tolist(), "trajectory_coordinate":centers.tolist()}
+    return {"status":"ok" if n>=win else "insufficient_data", "n":int(n), "window":int(win), "step":int(step),
+            "per_estimator":by_est, "monte_carlo":mc,
+            "four_tests":"Step 1-4 appliquees individuellement a chaque trajectoire d'estimateur; definitions operationnelles provisoires",
+            "mc_note":"les tests temporels ne sont pas appliques a l'ordre des tirages MC"}
+
+
+def estimator_validation_suite(series, seed=42, n_mc_paths=200, control=None, threshold_idx=None, gaussian_sigma=2.0):
+    """Validation en trois cohortes: initiale, pre-seuil et post-seuil.
+    Pour chaque cohorte: 29 estimateurs, Step 1-4 sur chaque trajectoire, MC 29.
+    F1/F2 sont calcules sur la cible brute lisse et sur chaque trajectoire estimeur.
+    Le MC pre-seuil sert ensuite de reference de controle predictif hors echantillon
+    contre les estimateurs observes post-seuil (sans appeler cela une prevision future).
+    """
+    x=np.asarray(series,dtype=float); n=len(x)
+    c=np.arange(n,dtype=float) if control is None else np.asarray(control,dtype=float)
+    if len(c)!=n: raise ValueError("control doit avoir la meme longueur que series")
+    if threshold_idx is not None and 0<int(threshold_idx)<n:
+        cut=int(threshold_idx)
+    else: cut=None
+    if cut is None:
+        cohorts={"initial":(x,c)}
+    else:
+        cohorts={"initial":(x,c), "pre_threshold":(x[:cut],c[:cut]), "post_threshold":(x[cut:],c[cut:])}
+    win=max(20,min(128,n//5))
+    stages={}
+    for si,(stage,(sx,sc)) in enumerate(cohorts.items()):
+        # Meme graine et meme index de chemin dans chaque cohorte: common random numbers.
+        stages[stage]=_cohort_validation(sx,seed,n_mc_paths,win,coordinate=sc,gaussian_sigma=gaussian_sigma)
+        # F1/F2 bruts de la cible dans le repere du controle, non z-score.
+        stages[stage]["raw_target_f1_f2"]=_f1_f2(sx,sc,gaussian_sigma=gaussian_sigma)
+    comparison={"status":"not_applicable"}
+    predictive_mc={"status":"not_applicable", "interpretation":"aucun seuil valide ou cohortes pre/post insuffisantes"}
+    if cut is not None and "pre_threshold" in stages and "post_threshold" in stages:
+        # Comparaison pre/post avant le controle MC retrospectif.
+        comparison={"status":"ok", "per_estimator":{}}
+        for name,_,_ in ESTIMATORS:
+            a=stages["pre_threshold"]["monte_carlo"].get("estimators",{}).get(name,{})
+            b=stages["post_threshold"]["monte_carlo"].get("estimators",{}).get(name,{})
+            ma,mb=a.get("median",float('nan')),b.get("median",float('nan'))
+            comparison["per_estimator"][name]={"pre_mc_median":ma,"post_mc_median":mb,
+                "delta_post_minus_pre":float(mb-ma) if math.isfinite(ma) and math.isfinite(mb) else float('nan')}
+        pre=stages["pre_threshold"]["monte_carlo"].get("estimators",{})
+        post_obs=apply_estimators(x[cut:])
+        checks={}; n_tested=0; n_inside=0
+        for name,_,_ in ESTIMATORS:
+            p=pre.get(name,{}); obs=post_obs.get(name,float('nan'))
+            lo,hi=p.get("q05",float('nan')),p.get("q95",float('nan'))
+            valid=math.isfinite(obs) and math.isfinite(lo) and math.isfinite(hi)
+            inside=bool(valid and lo<=obs<=hi)
+            checks[name]={"post_observed":obs,"pre_mc_q05":lo,"pre_mc_q95":hi,"inside_pre_mc_interval":inside,"status":"ok" if valid else "insufficient"}
+            if valid: n_tested+=1; n_inside+=int(inside)
+        predictive_mc={"status":"ok" if n_tested else "insufficient_data", "method":"pre-threshold MC interval vs one post-threshold observed estimate",
+                       "n_estimators_tested":n_tested,"n_inside_90pct_interval":n_inside,
+                       "empirical_coverage":float(n_inside/n_tested) if n_tested else float('nan'),"per_estimator":checks,
+                       "warning":"verification retrospective pre/post, pas une prevision prospective independante"}
+    return {"status":"segmented_provisional_protocol", "n_estimators_named":len(ESTIMATORS),
+            "n_unique_callables":len(UNIQUE_ESTIMATORS), "threshold_idx":cut,
+            "stages":stages,"pre_post_comparison":comparison,"predictive_mc_check":predictive_mc,
+            "protocol_order":["initial_MC_29_estimators","Step1-4_initial_trajectories","F1-F2_initial",
+                              "pre_threshold_MC_29_estimators","Step1-4_pre_threshold_trajectories","F1-F2_pre_threshold",
+                              "post_threshold_MC_29_estimators","Step1-4_post_threshold_trajectories","F1-F2_post_threshold",
+                              "pre_post_comparison","predictive_MC_pre_vs_post_check"],
+            "f1_f2_specification":{"F1":"gradient(y_smooth, p_coord)","F2":"gradient(F1, p_coord)",
+                                   "smoothing":"Gaussian", "gaussian_sigma":float(gaussian_sigma),
+                                   "sigma_status":"valeur explicite de reconstruction; parametre historique non present dans v7.1.3"},
+            "historical_protocol_gaps":["seuils/formules exacts historiques Step1-4 non presents dans v7.1.3",
+                                        "pondérations/segmentation exactes du MC historique non presentes dans v7.1.3; MC uniforme explicite ici"],
+            "f1_f2":"F1/F2 calcules sur cible brute lisse et trajectoires d'estimateurs, avant/apres seuil; aucune normalisation z-score avant derivation"}
+
+def analyze(df_or_path, control=None, target=None, fluxes=None, config=None, output_dir=None):
+    """Entree universelle.
+    df_or_path : DataFrame ou chemin CSV/Parquet/JSON.
+    Retourne dict complet + ecrit results.json / report.txt / thresholds.csv."""
+    # v7.1.3 AUDIT : deepcopy, sinon analyze() mutait l'objet config passe par l'appelant
+    # (window_sizes, n_bootstrap, output_dir ecres). Reutiliser le meme config sur
+    # deux datasets de n differents ecrasait window_sizes du premier appel.
+    cfg = copy.deepcopy(config) if config is not None else UniversalConfig()
+    if cfg.mode in MODE_PRESETS:
+        for k, v in MODE_PRESETS[cfg.mode].items():
+            # v7.1 : window_sizes du preset IGNORES — fenetres relatives (n/10,n/5,n/3) ou
+            # window_sizes explicites du config. Le preset n'ecrase plus un choix explicite.
+            if k == "window_sizes": continue
+            elif k == "n_bootstrap": cfg.n_bootstrap = v
+            elif k == "n_permutations": cfg.n_permutations = v
+            elif k == "n_mc_paths": cfg.n_mc_paths = v
+            elif k == "n_scan_permutations": cfg.n_scan_permutations = v
+    cfg.output_dir = output_dir or cfg.output_dir
+    t_start = time.time()
+    # --- chargement ---
+    if isinstance(df_or_path, (str, Path)):
+        path = Path(df_or_path)
+        src_hash = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
+        src_name = str(path)
+        if path.suffix.lower() in (".parquet", ".pq"):
+            df = pd.read_parquet(path)
+        elif path.suffix.lower() == ".json":
+            df = pd.read_json(path)
+        else:
+            df = pd.read_csv(path)
+    else:
+        df = df_or_path
+        src_hash = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
+        src_name = "dataframe"
+    ds = load_universal_dataset(df, control=control, target=target, fluxes=fluxes, source_name=src_name, source_hash=src_hash)
+    # v7.1 : fenetres RELATIVES a n, pour que la stabilite multi-fenetres soit vraiment testee
+    # et que les candidats couvrent l'evenement (fenetre 50 sur n=120 excluait 2008).
+    if cfg.use_relative_windows:
+        ws = sorted(set([max(cfg.min_group*2, ds.n//10), max(cfg.min_group*2, ds.n//5), max(cfg.min_group*2, ds.n//3)]))
+        ws = [w for w in ws if w < ds.n//2]
+        if ws: cfg.window_sizes = ws
+    _log(cfg, f"[V7.1] n={ds.n} controle={ds.control_name} cible={ds.target_name} flux={len(ds.flux_names)} fenetres={cfg.window_sizes}")
+    if ds.n < cfg.min_length:
+        _log(cfg, f"[V7] ATTENTION n={ds.n} < min_length={cfg.min_length} : resultats exploratoires.")
+    # --- estimateurs sur chaque flux (memes scenarios pour tous) ---
+    est_by_flux = {name: apply_estimators(ds.fluxes[name]) for name in ds.flux_names}
+    # --- scan + cascade ---
+    best = scan_threshold(ds.control, ds.target, window=cfg.window_sizes[0] if cfg.window_sizes else 80,
+                          min_group=cfg.min_group, seed=cfg.seed, n_boot=cfg.n_bootstrap, n_perm=cfg.n_permutations,
+                          n_scan_perm=cfg.n_scan_permutations, compute_scan_p=True)
+    cascade = cascade_5_thresholds(ds.control, ds.target, best["idx"], seed=cfg.seed) if best.get("status") == "ok" else {"status": "no_threshold"}
+    # v7.1.5 : MC segmente + Step1-4 + F1/F2 a chaque cohorte.
+    # La cible brute est toujours derivee dans le repere du controle; aucun z-score pre-derivee.
+    cut_idx = best.get("idx") if best.get("status") == "ok" else None
+    validation_by_flux = {name: estimator_validation_suite(ds.fluxes[name], seed=cfg.seed,
+                         n_mc_paths=max(200, cfg.n_mc_paths), control=ds.control, threshold_idx=cut_idx)
+                         for name in ds.flux_names}
+    # --- falsification + walk-forward ---
+    falsif = falsification_suite(ds, best, cfg)
+    wf = walk_forward(ds, best, cfg)
+    # --- L1..L7 + grade ---
+    levels = level_universal(ds, best, cascade, est_by_flux, cfg)
+    grade = grade_evidence(best, falsif, wf, cfg)
+    # --- invariance au renommage : test interne (P3) ---
+    # On re-analyse avec colonnes renommees en X1..Xk : le Cohen-d doit etre identique.
+    rename_ok = None
+    try:
+        df_ren = df.rename(columns={c: f"X{i}" for i, c in enumerate(df.columns)})
+        # retrouver controle/cible renommes
+        ctrl_r = f"X{list(df.columns).index(ds.control_name)}" if ds.control_name in df.columns else None
+        tgt_r = f"X{list(df.columns).index(ds.target_name)}" if ds.target_name in df.columns else None
+        if ctrl_r and tgt_r:
+            ds_r = load_universal_dataset(df_ren, control=ctrl_r, target=tgt_r)
+            best_r = scan_threshold(ds_r.control, ds_r.target, window=cfg.window_sizes[0] if cfg.window_sizes else 80, n_boot=20, n_perm=50, seed=cfg.seed, compute_scan_p=False)
+            rename_ok = bool(best.get("status") == "ok" and best_r.get("status") == "ok" and abs(best["cohen_d"]-best_r["cohen_d"]) < 1e-9)
+    except Exception as e:
+        rename_ok = False
+    result = {
+        "version": VERSION, "version_master": VERSION_MASTER,
+        "universal_contract": {"control": ds.control_name, "target": ds.target_name, "fluxes": ds.flux_names,
+            "n": ds.n, "control_monotone": ds.control_monotone,
+            "note": "Aucun domaine, aucun lexique, aucun poids par domaine. Le resultat ne depend pas du nom des colonnes."},
+        "config": cfg.to_dict(),
+        "scan": best, "cascade": cascade,
+        "levels": levels, "falsification": falsif, "walk_forward": wf, "grade": grade,
+        "estimators_by_flux": est_by_flux,
+        "estimator_validation_by_flux": validation_by_flux,
+        "prediction_metadata": {"question_id": None, "protocol_id": None, "note": "A renseigner explicitement avant toute aggregation predictive."},
+        "t_log_target": compute_tlog(est_by_flux.get(ds.target_name, {}), ds.n),
+        "invariance_rename_test": {"passed": rename_ok, "definition": "renommer les colonnes ne doit rien changer (P3)"},
+        "manifest": {
+            "data_hash_sha256": src_hash, "data_source": src_name,
+            "code_version": VERSION, "seed": cfg.seed, "mode": cfg.mode,
+            "python": sys.version, "numpy": np.__version__, "pandas": pd.__version__,
+            "elapsed_seconds": float(time.time()-t_start),
+            "reproducibility": "meme entree + meme seed + meme version = meme sortie",
+            "limits": "MC segmente et F1/F2 integres en v7.1.5. Step1-4 et schema historique de ponderation MC restent a rapprocher des specifications originales; sigma gaussien explicite. Les 29 noms ne garantissent pas 29 familles statistiques independantes.",
+        },
+    }
+    # --- exports ---
+    outdir = Path(cfg.output_dir); outdir.mkdir(parents=True, exist_ok=True)
+    with open(outdir/"results.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False, default=float)
+    # thresholds.csv
+    rows = []
+    if best.get("status") == "ok":
+        rows.append({"threshold": "T0_central", "control_value": best["control_value"], "cohen_d": best["cohen_d"],
+                     "ci_low": best.get("cohen_d_ci_low"), "ci_high": best.get("cohen_d_ci_high"), "p_permutation": best.get("p_permutation")})
+    if isinstance(cascade, dict):
+        for k in ["T_minus2", "T_minus1", "T_plus1", "T_plus2"]:
+            v = cascade.get(k, {})
+            rows.append({"threshold": k, "control_value": v.get("control_value"), "cohen_d": None, "ci_low": None, "ci_high": None, "p_permutation": None})
+    pd.DataFrame(rows).to_csv(outdir/"thresholds.csv", index=False)
+    # report.txt lisible
+    lines = []
+    lines.append(f"UNIVERSAL_LOG {VERSION} — Rapport universel")
+    lines.append(f"Controle : {ds.control_name} | Cible : {ds.target_name} | n = {ds.n} | Flux : {len(ds.flux_names)}")
+    lines.append(f"Grade : {grade['grade']} — {grade['verdict']}")
+    if grade.get("reasons"): lines.append("Raisons : " + "; ".join(grade["reasons"]))
+    if best.get("status") == "ok":
+        lines.append(f"Seuil T0 : {ds.control_name} = {best['control_value']:.4g} | Cohen-d = {best['cohen_d']:.3f} "
+                     f"IC95% [{best.get('cohen_d_ci_low')}, {best.get('cohen_d_ci_high')}] | p_perm = {best.get('p_permutation')}")
+        lines.append(f"Direction L1 : {levels['L1_direction'].get('direction')} | Regime L3 : {levels['L3_regime'].get('state')} "
+                     f"| Force signal L4 : {levels['L4_signal'].get('level')} | p corrige scan = {best.get('p_permutation_scan_corrected')}")
+        lines.append(f"T_log (diagnostic, pas preuve) : {result['t_log_target'].get('t_log')} | d_median = {result['t_log_target'].get('d_median')}")
+        _inter = levels.get("L7_interactions", {})
+        if isinstance(_inter, dict) and _inter.get("status") == "ok":
+            lines.append(f"L7 interactions : {_inter.get('summary', {}).get('total_complementary_pairs')} paires complementaires, "
+                         f"{_inter.get('summary', {}).get('n_segments')} segments — convergence ET divergence, pas de consensus force")
+            for _fn, _pf in _inter.get("per_flux", {}).items():
+                _pairs = _pf.get("complementary_pairs", [])[:3]
+                if _pairs:
+                    lines.append(f"  {_fn} paires top : " + "; ".join([f"{x.get('estimator_a') or x.get('estimator_pre')} (seg {x.get('peak_segment_a')}) + {x.get('estimator_b') or x.get('estimator_post')} (seg {x.get('peak_segment_b')})" for x in _pairs]))
+    else:
+        lines.append("Aucun seuil fini — ne pas annoncer de seuil.")
+    lines.append(f"Walk-forward F1 : {wf.get('mean_f1')} | Stabilite multi-fenetres : {falsif.get('multi_window', {}).get('stability')}")
+    lines.append(f"Invariance renommage : {rename_ok} (P3)")
+    lines.append(f"Manifest : data_hash={src_hash[:16]}... seed={cfg.seed} mode={cfg.mode} duree={result['manifest']['elapsed_seconds']:.1f}s")
+    lines.append("Limites : detection + falsification. Replication independante requise avant toute decision.")
+    (outdir/"report.txt").write_text("\n".join(lines), encoding="utf-8")
+    _log(cfg, "\n".join(lines))
+    return result
+
+# ---------------------------------------------------------------------------
+# PREDICTION VERROUILLEE — hors du coeur analyse, jamais dans analyze()
+# ---------------------------------------------------------------------------
+def _motif_of_analysis(res):
+    """Extrait le motif de divergence d'une analyse : paires complementaires sur le FLUX CIBLE seul.
+    v7.1 : compter les paires de tous les flux (dont le bruit pur) laissait le bruit voter pour le motif.
+    Seul le flux cible compte pour la prediction."""
+    target_name = None
+    try: target_name = res.get("universal_contract", {}).get("target")
+    except Exception: pass
+    pairs = set()
+    try:
+        inter = res.get("levels", {}).get("L7_interactions", {})
+        _per = inter.get("per_flux", {})
+        if target_name and target_name in _per:
+            _per = {target_name: _per[target_name]}
+        for _fn, _pf in _per.items():
+            for pr in _pf.get("complementary_pairs", []):
+                if pr.get("estimator_a") and pr.get("estimator_b"):
+                    pairs.add((pr.get("estimator_a"), pr.get("estimator_b")))
+                elif pr.get("estimator_pre") and pr.get("estimator_post"):
+                    pairs.add((pr.get("estimator_pre"), pr.get("estimator_post")))
+    except Exception:
+        pass
+    return pairs
+
+def _holdout_motif_check(res):
+    """Validation temporelle : le motif est extrait des segments d'apprentissage uniquement.
+    Le dernier segment est strictement reserve au test et ne participe jamais a la construction du motif.
+    """
+    try:
+        inter = res.get("levels", {}).get("L7_interactions", {})
+        segs = inter.get("segments", [])
+        if len(segs) < 3: return False, "moins de 3 segments"
+        last = len(segs)-1
+        per_flux = inter.get("per_flux", {})
+        tgt = res.get("universal_contract", {}).get("target")
+        if tgt and tgt in per_flux: per_flux = {tgt: per_flux[tgt]}
+        if not per_flux: return False, "pas de per_flux"
+        oks, tot = 0, 0
+        for _fn, pf in per_flux.items():
+            # Train motif uniquement sur les segments avant le dernier.
+            profiles = pf.get("profiles", {})
+            train_candidates = []
+            for name, profile in profiles.items():
+                vals = profile.get("informativeness_per_segment", [])
+                train_vals = [v for v in vals[:last] if isinstance(v, (int, float)) and math.isfinite(v)]
+                if train_vals:
+                    train_candidates.append((name, float(max(train_vals))))
+            if not train_candidates: continue
+            train_candidates.sort(key=lambda z: z[1], reverse=True)
+            predicted = {name for name, _ in train_candidates[:3]}
+            last_top = pf.get("per_segment_top", {}).get(f"segment_{last}", [])
+            last_names = {x.get("estimator") for x in last_top}
+            tot += 1
+            if predicted & last_names: oks += 1
+        if tot == 0: return False, "aucun motif calculable sur les segments d'apprentissage"
+        return (oks/tot >= 0.5), f"{oks}/{tot} flux : top apprentissage recoupe le dernier segment tenu"
+    except Exception as e:
+        return False, f"erreur holdout : {e}"
+
+def predict_universal(analyses, question):
+    """Prediction de MOTIF, verrouillee.
+    analyses : liste de resultats analyze() (dicts), tous sur la MEME question ecrite.
+    question : str, la question affinee (ex : 'y a-t-il un motif volatilite pre/post T0 ?').
+    REFUSE tant que toutes les conditions ne sont pas remplies :
+      1. >= min_analyses_for_prediction analyses (defaut 5)
+      2. question non vide
+      3. chaque analyse : grade A ou B, p corrige scan <=0.05, walk-forward >=0.5, stabilite >=0.60
+      4. motif commun : au moins une paire complementaire (pre, post) presente dans >=3 analyses
+      5. hold-out par segment tenu : >=50% des analyses passent
+    Si autorisee, la prediction est : le profil du segment suivant.
+    Elle sort en intervalle + condition + test falsifiable, jamais en point.
+    Sortie : dict avec status allowed/refused, motif, prediction, test_falsifiable, raisons."""
+    reasons = []
+    if not isinstance(question, str) or not question.strip():
+        reasons.append("question affinee manquante : ecrire la question, la decouverte et le test qui peut la tuer")
+    if not isinstance(analyses, list) or len(analyses) < 5:
+        reasons.append(f"analyses insuffisantes : {len(analyses) if isinstance(analyses, list) else 0}/5 minimum, meme question")
+    if reasons:
+        return {"status": "refused", "prediction": None, "reasons": reasons,
+                "note": "prediction non autorisee — retourner a l'analyse, affiner la question, accumuler des analyses"}
+    # 2b. identite de protocole : aucune aggregation d'analyses non comparables.
+    metas = []
+    for i, res in enumerate(analyses):
+        md = res.get("prediction_metadata", {}) if isinstance(res, dict) else {}
+        qid, pid = md.get("question_id"), md.get("protocol_id")
+        if not qid or not pid:
+            reasons.append(f"analyse {i} : question_id/protocol_id absents (identite de protocole requise)")
+        else:
+            metas.append((str(qid), str(pid)))
+    if metas and (len(metas) != len(analyses) or len(set(metas)) != 1):
+        reasons.append("analyses incompatibles : question_id ou protocol_id differents")
+    # 3. qualite de chaque analyse
+    for i, res in enumerate(analyses):
+        g = res.get("grade", {}).get("grade") if isinstance(res, dict) else None
+        if g not in ("A", "B"):
+            reasons.append(f"analyse {i} : grade {g} (il faut A ou B)")
+        p_corr = res.get("scan", {}).get("p_permutation_scan_corrected", res.get("scan", {}).get("p_permutation")) if isinstance(res, dict) else None
+        if not (isinstance(p_corr, float) and math.isfinite(p_corr) and p_corr <= 0.05):
+            reasons.append(f"analyse {i} : p corrige scan {p_corr} (il faut <=0.05)")
+        wf = res.get("walk_forward", {}).get("mean_f1") if isinstance(res, dict) else None
+        wf_votes = res.get("walk_forward", {}).get("n_splits_used", 0) if isinstance(res, dict) else 0
+        if not (isinstance(wf, float) and wf >= 0.50 and wf_votes >= 2):
+            reasons.append(f"analyse {i} : walk-forward {wf} (il faut >=0.50 et >=2 plis votes, votes={wf_votes})")
+        stab = res.get("falsification", {}).get("multi_window", {}).get("stability") if isinstance(res, dict) else None
+        if not (isinstance(stab, float) and stab >= 0.60):
+            reasons.append(f"analyse {i} : stabilite multi-fenetres {stab} (il faut >=0.60, prouvee sur >=2 fenetres)")
+    # 4. motif commun
+    motifs = [_motif_of_analysis(r) for r in analyses]
+    from collections import Counter
+    cnt = Counter()
+    for m in motifs:
+        for pair in m: cnt[pair] += 1
+    common = [pair for pair, c in cnt.items() if c >= 3]
+    if not common:
+        reasons.append("aucun motif commun : aucune paire complementaire (pre, post) presente dans >=3 analyses")
+    # 5. hold-out
+    hold_ok, hold_details = [], []
+    for i, res in enumerate(analyses):
+        ok, det = _holdout_motif_check(res)
+        hold_ok.append(ok); hold_details.append(f"analyse {i} : {det}")
+    if sum(hold_ok)/max(len(hold_ok), 1) < 0.5:
+        reasons.append(f"hold-out segment tenu echoue : {sum(hold_ok)}/{len(hold_ok)} analyses passent (il faut >=50%)")
+    if reasons:
+        return {"status": "refused", "prediction": None, "reasons": reasons, "holdout_details": hold_details,
+                "note": "prediction non autorisee — le motif n'est pas encore stable"}
+    # autorisee : prediction de motif, en intervalle + condition + test
+    common_sorted = sorted(common, key=lambda pr: cnt[pr], reverse=True)[:3]
+    motif = [{"estimator_a": a, "estimator_b": b, "n_analyses_partageant": int(cnt[(a, b)])} for a, b in common_sorted]
+    return {"status": "allowed", "question": question, "motif": motif,
+            "prediction": {
+                "type": "profil_du_segment_suivant",
+                "enonce": "SI le regime tient, ALORS le segment suivant devrait montrer l'estimateur TARDIF (b) informatif (|Cohen-d| >= 0.8) et l'estimateur PRECOCE (a) non informatif (< 0.5), pour chaque paire du motif.",
+                "paires": motif,
+                "intervalle": "informativeness tardif |Cohen-d| >= 0.8, precoce < 0.5 — pas de valeur ponctuelle",
+                "condition": "regime tient = nouveau segment analyse avec meme question, meme protocole, grade A/B"},
+            "test_falsifiable": "Analyser le segment suivant avec analyze() : si l'estimateur tardif (b) n'est PAS dans le top informatifs du segment, le motif est faux et la prediction est rejetee.",
+            "holdout_details": hold_details,
+            "note": "Prediction de motif, pas de seuil ponctuel. Elle doit etre testee sur le segment suivant avant toute decision."}
+
+def run_regression_tests():
+    """Test de non-regression v7.1.3 : echoue si un correctif disparait (ecrasement par edition).
+    Verifie : p corrige present, L6 desactive, L7 sans probabilites, L4 sans risk_score,
+    cap tendance, stabilite 1 fenetre = 0, fenetres relatives, predict refuse par defaut."""
+    import io, contextlib
+    # v7.1.3 AUDIT : plus de chemins /mnt/data en dur, tempfile pour marcher sous Windows / hors Linux.
+    _tmp = tempfile.TemporaryDirectory()
+    _tmpdir = _tmp.name
+    checks = []
+    def _check(name, ok, detail=""):
+        checks.append({"name": name, "passed": bool(ok), "detail": str(detail)[:200]})
+    # 1. demo step : doit trouver un seuil, avec p corrige, L6 desactive, L7 interactions
+    cfg = UniversalConfig(mode="fast", verbose=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = analyze(demo_dataset("step", n=200), config=cfg, output_dir=f"{_tmpdir}/regression_step")
+    _check("step trouve seuil", res.get("scan", {}).get("status") == "ok")
+    _check("p corrige scan present", math.isfinite(res.get("scan", {}).get("p_permutation_scan_corrected", float("nan"))))
+    _check("L6 desactive", res.get("levels", {}).get("L6_prediction", {}).get("status") == "disabled_in_core")
+    _check("L6 extrapolation absente", res.get("levels", {}).get("L6_next_threshold", {}).get("status") == "disabled_in_core")
+    _check("L7 interactions ok", res.get("levels", {}).get("L7_interactions", {}).get("status") == "ok")
+    _check("L7 sans probabilites", "probabilities" not in res.get("levels", {}).get("L7_interactions", {}))
+    _check("L4 sans risk_score", "risk_score" not in res.get("levels", {}).get("L4_signal", {}))
+    _check("L4 signal present", res.get("levels", {}).get("L4_signal", {}).get("status") == "ok")
+    _check("fenetres relatives", res.get("config", {}).get("window_sizes") == sorted(set([max(8, 200//10), max(8, 200//5), max(8, 200//3)])))
+    # 2. null : doit dire D ou C, pas A
+    cfg2 = UniversalConfig(mode="fast", verbose=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        res_null = analyze(demo_dataset("null", n=200), config=cfg2, output_dir=f"{_tmpdir}/regression_null")
+    _check("null pas de A", res_null.get("grade", {}).get("grade") in ("C", "D"))
+    # 3. predict refuse par defaut (0 analyse, question vide)
+    pr = predict_universal([], "")
+    _check("predict refuse par defaut", pr.get("status") == "refused")
+    # v7.1.3 AUDIT : nouveaux checks
+    # - permuted_control doit s'effondrer (ancien bug : mediane == observe)
+    _pc = res.get("falsification", {}).get("permuted_control_same_cut", {})
+    _check("permuted_control s'effondre", math.isfinite(_pc.get("d_permuted_median", float("nan"))) and abs(_pc.get("d_permuted_median", 999)) < 0.5 * abs(_pc.get("d_observed", 0)) if _pc.get("d_observed") else False, f"d_obs={_pc.get('d_observed')} d_perm_med={_pc.get('d_permuted_median')}")
+    # - walk_forward : abstentions comptees, votes >= 0, F1 conservative present
+    _wf = res.get("walk_forward", {})
+    _check("walk_forward abstentions comptees", "n_abstentions" in _wf and "mean_f1_conservative" in _wf, f"wf={_wf.get('mean_f1')} cons={_wf.get('mean_f1_conservative')} votes={_wf.get('n_splits_used')} abst={_wf.get('n_abstentions')}")
+    # - cands respectent [w, n-w) meme quand n>400
+    _big = demo_dataset("step", n=1000, seed=42)
+    _cfg_big = UniversalConfig(mode="fast", verbose=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _res_big = analyze(_big, config=_cfg_big, output_dir=f"{_tmpdir}/regression_big")
+    _w_big = _res_big.get("config", {}).get("window_sizes", [80])[0]
+    _idx_big = _res_big.get("scan", {}).get("idx")
+    _check("cands dans [w, n-w)", _idx_big is not None and _w_big <= _idx_big < 1000 - _w_big, f"idx={_idx_big} w={_w_big} n=1000")
+    # - les 29 noms sont preserves; les fonctions partagees sont signalees via dedup.
+    _check("29 noms conserves", len(ESTIMATORS) == 29, f"unique={len(UNIQUE_ESTIMATORS)} noms={len(ESTIMATORS)}")
+    # - config non mutee par analyze()
+    _cfg_mut = UniversalConfig(mode="fast", verbose=False)
+    _ws_before = list(_cfg_mut.window_sizes)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ = analyze(demo_dataset("step", n=120), config=_cfg_mut, output_dir=f"{_tmpdir}/regression_mut1")
+        _ = analyze(demo_dataset("step", n=300), config=_cfg_mut, output_dir=f"{_tmpdir}/regression_mut2")
+    _check("config non mutee", list(_cfg_mut.window_sizes) == _ws_before, f"avant={_ws_before} apres={list(_cfg_mut.window_sizes)}")
+    # - falsification nuls utilisent p corrige scan
+    _wn = res.get("falsification", {}).get("white_noise_null", {})
+    _check("white_null p corrige scan", "p_permutation_local" in _wn and math.isfinite(_wn.get("p_permutation", float("nan"))), f"p_corr={_wn.get('p_permutation')} p_local={_wn.get('p_permutation_local')}")
+    # 4. predict refuse sur analyses mixtes (questions differentes / grades faibles)
+    pr2 = predict_universal([res, res_null], "question test")
+    _check("predict refuse analyses insuffisantes", pr2.get("status") == "refused")
+    # 5. stabilite 1 fenetre = 0 : falsification avec 1 seule fenetre
+    cfg1w = UniversalConfig(mode="fast", verbose=False, use_relative_windows=False, window_sizes=[50])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res1w = analyze(demo_dataset("step", n=200), config=cfg1w, output_dir=f"{_tmpdir}/regression_1w")
+    _check("stabilite 1 fenetre = 0", res1w.get("falsification", {}).get("multi_window", {}).get("stability") == 0.0)
+    # v7.1.4 validation smoke tests : tous les noms ont une sortie et les graines sont deterministes.
+    _suite = estimator_validation_suite(np.sin(np.linspace(0, 20, 100)) + np.random.default_rng(7).normal(0,.1,100), seed=123, n_mc_paths=200)
+    _check("29 estimateurs dans les 3 cohortes", all(len(_suite.get("stages", {}).get(st, {}).get("per_estimator", {})) == 29 for st in ["initial", "pre_threshold", "post_threshold"]))
+    _check("4 tests par estimateur et cohorte", all(len(v.get("tests", {})) == 4 for st in _suite.get("stages", {}).values() for v in st.get("per_estimator", {}).values()))
+    _check("MC 200 chemins minimum par cohorte", all(st.get("monte_carlo", {}).get("n_paths", 0) >= 200 for st in _suite.get("stages", {}).values()))
+    _check("MC tirages non temporels", all(st.get("monte_carlo", {}).get("draw_order_is_not_time") is True for st in _suite.get("stages", {}).values()))
+    _check("F1/F2 brut pre/post", all(st.get("raw_target_f1_f2", {}).get("f1_definition") == "gradient(y_smooth, p_coord)" for st in _suite.get("stages", {}).values()))
+    ok_all = all(c["passed"] for c in checks)
+    print(f"[REGRESSION v7.1.5] {'TOUS OK' if ok_all else 'ECHEC'} : {sum(c['passed'] for c in checks)}/{len(checks)}")
+    for c in checks:
+        print(f"  {'OK ' if c['passed'] else 'FAIL'} {c['name']} {c['detail']}")
+    return {"all_passed": ok_all, "checks": checks}
+
+# ---------------------------------------------------------------------------
+# DEMOS GENERIQUES — aucun domaine, trois cas purs : marche / logistique / nul
+# ---------------------------------------------------------------------------
+def demo_dataset(kind="logistic", n=300, seed=42):
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0, 100, n)
+    if kind == "step":
+        y = np.where(x < 50, 0.0, 1.0) + rng.normal(0, 0.15, n)
+    elif kind == "null":
+        y = rng.normal(0, 1.0, n)  # aucun seuil : le pipeline DOIT dire D / pas de preuve
+    else:  # logistic
+        y = 1.0/(1.0+np.exp(-(x-50)/5.0)) + rng.normal(0, 0.08, n)
+    # deuxieme flux : copie bruitee (coherence) + bruit pur (doit diverger)
+    return pd.DataFrame({"axe": x, "observable": y, "observable_bruite": y + rng.normal(0, 0.1, n), "bruit_pur": rng.normal(0, 1, n)})
+
+def generate_example_csv(kind, path):
+    df = demo_dataset(kind)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    return path
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="UNIVERSAL_LOG v7 — detection de seuils universelle + falsification (aucun domaine).")
+    ap.add_argument("--input", type=str, default=None, help="CSV / Parquet / JSON")
+    ap.add_argument("--control", type=str, default=None, help="Colonne controle (axe ordonne). Sinon infere.")
+    ap.add_argument("--target", type=str, default=None, help="Colonne cible. Sinon infere.")
+    ap.add_argument("--mode", type=str, default="fast", choices=["fast", "robust", "full"])
+    ap.add_argument("--output", type=str, default="./results_v7")
+    ap.add_argument("--demo", type=str, default=None, choices=["step", "logistic", "null"], help="Demo generique (aucun domaine).")
+    ap.add_argument("--harmonic-ablation", action="store_true", help="Compare harmonique vs uniforme (ablation, jamais prior).")
+    ap.add_argument("--self-test", action="store_true", help="Test de non-regression v7.1.3 (correctifs presents).")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args(argv)
+    cfg = UniversalConfig(mode=args.mode, seed=args.seed, output_dir=args.output, harmonic_ablation=args.harmonic_ablation)
+    if args.self_test:
+        run_regression_tests()
+        return None
+    if args.demo:
+        path = generate_example_csv(args.demo, f"./demo_{args.demo}.csv")
+        print(f"[DEMO {args.demo}] genere : {path}")
+        return analyze(path, config=cfg, output_dir=args.output)
+    if not args.input:
+        ap.error("--input requis (ou --demo step|logistic|null)")
+    return analyze(args.input, control=args.control, target=args.target, config=cfg, output_dir=args.output)
+
+if __name__ == "__main__":
+    main()
